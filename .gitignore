@@ -1,0 +1,60 @@
+# SimpleJellyMus - what must never end up in a commit.
+#
+# The real login (access token!) is stored outside this repository, in
+# ~/.config/simplejellymus/config.json (mode 600) and the caches live in
+# ~/.cache/simplejellymus/. The rules below are the safety net for a config
+# file, a log or a socket that somehow gets copied in here.
+
+# --- Python byte code and build output -------------------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.eggs/
+build/
+dist/
+*.whl
+
+# --- virtual environments ---------------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+
+# --- tooling caches ---------------------------------------------------------
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# --- local secrets and settings --------------------------------------------
+.env
+.env.*
+config.json
+credentials*.json
+*token*.json
+*.token
+*.secret
+*.secret.json
+
+# --- runtime leftovers (sockets, pid files, scratch) ------------------------
+*.sock
+*.pid
+*.tmp
+tmp/
+scratch/
+*.log
+
+# --- editor and OS clutter --------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*.bak
+*.orig
+*.local
+*~
+.DS_Store
+Thumbs.db
+

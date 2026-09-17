@@ -1,0 +1,14 @@
+# SimpleJellyMus dependencies
+#
+# The player is written with the Python standard library only (urllib, json,
+# socket, threading, tkinter) and drives the system mpv binary over its JSON IPC
+# interface (mpv must be installed separately).
+#
+# Pillow is the only third-party Python package. It is used for cover art
+# (loading JPEG/PNG artwork, cover-cropping and rounded corners) and is already
+# installed on this machine (python-pillow 12.3.0).
+Pillow>=10.0.0
+
+# System packages used at runtime:
+#   mpv        - audio playback backend + JSON IPC control
+#   python     - tkinter must be available (part of the default Python install)

@@ -1,0 +1,28 @@
+# SimpleJellyMus launcher.
+#
+# This file is a TEMPLATE: the APPDIR placeholder used in Exec/Path is replaced
+# with the absolute path of the project directory by install.sh, which writes the
+# result to ~/.local/share/applications/simplejellymus.desktop and installs the
+# icon in ~/.local/share/icons/hicolor/256x256/apps/. Run ./install.sh, no root
+# is needed.
+#
+# StartupWMClass matches the window class main.py sets, so the desktop can tell
+# which window belongs to this launcher. SingleMainWindow tells the desktop that
+# a second click should focus the running window instead of starting the app
+# again (which is what instance.py guarantees as well).
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=SimpleJellyMus
+GenericName=Random Jellyfin Music Player
+Comment=Play random songs from your Jellyfin library (audio only)
+Exec=python3 @APPDIR@/main.py
+TryExec=python3
+Path=@APPDIR@
+Icon=simplejellymus
+Terminal=false
+Categories=Audio;AudioVideo;Player;Music;
+Keywords=music;jellyfin;audio;random;mpv;player;
+StartupNotify=true
+StartupWMClass=simplejellymus
+SingleMainWindow=true
