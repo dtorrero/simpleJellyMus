@@ -26,8 +26,11 @@ import signal
 import sys
 import threading
 import tkinter as tk
+from pathlib import Path
 from tkinter import messagebox
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
+
+from PIL import Image, ImageTk
 
 import jellyfin
 from instance import SingleInstance
@@ -39,6 +42,13 @@ from ui import (BACKGROUND, CARD, CARD_LIGHT, DANGER, MUTED, TEXT, WINDOW_SIZE, 
 GEOMETRY_RE = re.compile(r"^(\d{3,5})x(\d{3,5})$")
 MIN_WINDOW_SIZE = (900, 620)
 WINDOW_CLASS = "simplejellymus"       # WM_CLASS, matches StartupWMClass in the launcher
+ICON_FILE = Path(__file__).resolve().parent / "assets" / "fire_icon_variant_1.png"
+# Sizes offered to the window manager for the task bar, the title bar and the
+# window menu. They all end up in one _NET_WM_ICON property, and Tk quietly sets
+# nothing at all once those images add up to more than about 64k pixels - a lone
+# 256x256 icon is already too big for that, which is why the master is only ever
+# the source for these and never sent as it is.
+WINDOW_ICON_SIZES = (128, 64, 48, 32, 24, 16)
 
 
 class Application:
@@ -57,10 +67,12 @@ class Application:
         self._save_job: Optional[str] = None
         self._drain_job: Optional[str] = None
         self._messages: queue.Queue = queue.Queue()
+        self._icon_images: List[tk.PhotoImage] = []
 
         self.root.title("SimpleJellyMus")
         self.root.configure(bg=BACKGROUND)
         self.root.protocol("WM_DELETE_WINDOW", self.shutdown)
+        self._apply_icon()
         self._geometry()
         self._drain_job = self.root.after(60, self._drain)
         atexit.register(self.shutdown)
@@ -71,6 +83,26 @@ class Application:
             self.connect()
 
     # ------------------------------------------------------------------ helpers
+    def _apply_icon(self) -> None:
+        """Show the application icon in the task bar, the title bar and the menu.
+
+        The launcher already supplies the icon for a menu start; this also covers
+        running the program straight from a terminal. Every size a panel or a
+        window decoration may ask for is published, so none of them has to scale
+        the master down itself. Decoration only - a missing or unreadable file is
+        ignored, never a reason to fail to start.
+        """
+        try:
+            with Image.open(ICON_FILE) as source:
+                images = [ImageTk.PhotoImage(source.resize((size, size), Image.LANCZOS))
+                          for size in WINDOW_ICON_SIZES if size <= source.width]
+        except (OSError, ValueError, tk.TclError):
+            return
+        if not images:
+            return
+        self._icon_images = images      # Tk drops images nobody holds a reference to
+        self.root.iconphoto(True, *images)
+
     def _geometry(self) -> None:
         """Apply the remembered window mode and size (windowed by default)."""
         self.root.minsize(*MIN_WINDOW_SIZE)

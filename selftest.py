@@ -4,7 +4,7 @@
 Spins up a tiny fake Jellyfin server (with decoy video items) and checks the
 client, the music-only filter, cover download, the preload cache, the whole
 playback engine (auto-advance, next, previous, pause, volume, seek), the UI
-layout with long titles and the single-instance guard.
+layout with long titles, the launcher/icon wiring and the single-instance guard.
 
     python3 selftest.py
 
@@ -15,6 +15,7 @@ throwaway directory, so your real Jellyfin login and library are never used.
 import json
 import math
 import os
+import re
 import shutil
 import struct
 import tempfile
@@ -595,6 +596,45 @@ def test_ui(report: Reporter) -> None:
         root.destroy()
 
 
+def test_launcher(report: Reporter) -> None:
+    """The icon, the installer and the launcher must agree on one file and name.
+
+    Renaming the asset or the app id is easy to do in one place and forget in the
+    others; the desktop would then just show a generic icon without complaining.
+    """
+    import main
+
+    project = Path(__file__).resolve().parent
+    icon = main.ICON_FILE
+    try:
+        from PIL import Image
+
+        with Image.open(icon) as image:
+            width, height = image.size
+            is_png = image.format == "PNG"
+    except OSError as exc:
+        report.check(f"the application icon file is readable ({exc})", False)
+        return
+    report.check("the application icon is a PNG", is_png, f"assets/{icon.name}")
+    report.check("it is square and big enough for a menu icon",
+                 width == height and width >= 256, f"{width}x{height}")
+
+    installer = (project / "install.sh").read_text(encoding="utf-8")
+    report.check("install.sh installs the icon main.py shows in the window",
+                 f"assets/{icon.name}" in installer, f"assets/{icon.name}")
+    app_id = re.search(r'^APP_ID="([^"]+)"', installer, re.M)
+    launcher = (project / "simplejellymus.desktop").read_text(encoding="utf-8")
+    icon_name = re.search(r"^Icon=(.+)$", launcher, re.M)
+    report.check("the launcher asks for the icon the installer creates",
+                 bool(app_id and icon_name) and icon_name.group(1).strip() == app_id.group(1),
+                 f"Icon={icon_name.group(1) if icon_name else '?'} vs "
+                 f"APP_ID={app_id.group(1) if app_id else '?'}")
+    wm_class = re.search(r"^StartupWMClass=(.+)$", launcher, re.M)
+    report.check("the launcher matches the window class the app sets",
+                 bool(wm_class) and wm_class.group(1).strip() == main.WINDOW_CLASS,
+                 f"StartupWMClass={wm_class.group(1) if wm_class else '?'} vs {main.WINDOW_CLASS}")
+
+
 def test_instance(report: Reporter) -> None:
     """The single-instance guard: a second launch only focuses the first copy."""
     import socket as socket_module
@@ -676,6 +716,8 @@ def main() -> int:
         engine = test_engine(report, client)
         print("\nUser interface")
         test_ui(report)
+        print("\nLauncher and application icon")
+        test_launcher(report)
         print("\nSingle instance")
         test_instance(report)
     finally:

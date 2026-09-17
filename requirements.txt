@@ -5,8 +5,11 @@
 # interface (mpv must be installed separately).
 #
 # Pillow is the only third-party Python package. It is used for cover art
-# (loading JPEG/PNG artwork, cover-cropping and rounded corners) and is already
-# installed on this machine (python-pillow 12.3.0).
+# (loading JPEG/PNG artwork, cover-cropping and rounded corners) and to publish
+# the application icon to the window manager at the sizes panels and title bars
+# ask for; install.sh also uses it to generate the smaller sizes of the
+# application icon, and simply skips them if it is not installed. Pillow is
+# already installed on this machine (python-pillow 12.3.0).
 Pillow>=10.0.0
 
 # System packages used at runtime:

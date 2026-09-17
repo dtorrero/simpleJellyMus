@@ -54,10 +54,19 @@ you used last time) and `Esc` switches between windowed and fullscreen.
 ```
 
 The installer renders `simplejellymus.desktop` with this directory's real path,
-writes it to `~/.local/share/applications/simplejellymus.desktop`, copies the icon
-to `~/.local/share/icons/hicolor/256x256/apps/` and refreshes the menu/icon
+writes it to `~/.local/share/applications/simplejellymus.desktop`, installs the
+application icon into the `hicolor` icon theme and refreshes the menu/icon
 caches. **SimpleJellyMus** then shows up under *Audio / Music* and can be pinned
 to the panel or the task manager.
+
+The icon is `assets/fire_icon_variant_1.png`: installed as-is (1024×1024) plus
+downscaled copies for the menu, the panel and the window list (256, 128, 64, 48,
+32, 24 and 16 px, generated with Pillow). Both the launcher and the window itself
+use it, so it also shows when the program is started from a terminal; the window
+sends the window manager its own set of sizes (128 px down to 16 px) as well, so
+a panel or a title bar never has to scale a single large bitmap down itself. To
+use a different picture, point `ICON_SOURCE=` in `install.sh` and `ICON_FILE` in
+`main.py` at the new file and run `./install.sh` again.
 
 **Only one window, ever.** The launcher is marked `SingleMainWindow`, and the app
 itself enforces it: the first copy binds a socket in `$XDG_RUNTIME_DIR`, and
@@ -140,9 +149,9 @@ Tkinter UI (ui.py) ──state snapshots── PlayerEngine (player.py)
 | `player.py` | mpv IPC client, preloader cache, random play queue, engine |
 | `ui.py` | Tkinter login screen and fullscreen player UI |
 | `selftest.py` | offline self-test: fake Jellyfin server + generated audio (see below) |
-| `install.sh` | installs/removes the menu entry and the icon |
+| `install.sh` | installs/removes the menu entry and the icon (see below) |
 | `simplejellymus.desktop` | launcher template (`@APPDIR@` is filled in by `install.sh`) |
-| `assets/simplejellymus.png` | application icon (256×256, matches the app palette) |
+| `assets/fire_icon_variant_1.png` | application icon (1024×1024 master, installed in several sizes) |
 
 ## Self-test (no Jellyfin server needed)
 
@@ -170,7 +179,7 @@ are never touched. Set `SELFTEST_DEBUG=1` for verbose mpv logging.
 | `~/.cache/simplejellymus/covers/` | album art cache |
 | `$XDG_RUNTIME_DIR/simplejellymus.sock` | single-instance guard (removed when the app quits) |
 | `~/.local/share/applications/simplejellymus.desktop` | menu entry created by `install.sh` |
-| `~/.local/share/icons/hicolor/256x256/apps/simplejellymus.png` | icon installed by `install.sh` |
+| `~/.local/share/icons/hicolor/<size>x<size>/apps/simplejellymus.png` | icon installed by `install.sh` (one copy per size) |
 
 Delete the config file (or run `--reset-login`) to change accounts. Nothing in the
 repository itself ever holds your credentials — the token only lives in the config

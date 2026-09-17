@@ -3,8 +3,8 @@
 # This file is a TEMPLATE: the APPDIR placeholder used in Exec/Path is replaced
 # with the absolute path of the project directory by install.sh, which writes the
 # result to ~/.local/share/applications/simplejellymus.desktop and installs the
-# icon in ~/.local/share/icons/hicolor/256x256/apps/. Run ./install.sh, no root
-# is needed.
+# icon into the hicolor theme under ~/.local/share/icons/ (see ICON_SOURCE in
+# install.sh). Run ./install.sh, no root is needed.
 #
 # StartupWMClass matches the window class main.py sets, so the desktop can tell
 # which window belongs to this launcher. SingleMainWindow tells the desktop that
