@@ -1,0 +1,35 @@
+{
+  "_comment": [
+    "Your hand-made verdicts. They always win over every automatic layer",
+    "(tags, rules, Wikipedia/Wikidata/MusicBrainz, the LLM and the audio",
+    "classifier), and they are never overwritten by a re-run.",
+    "",
+    "Three ways to use it:",
+    "",
+    "  1. Force the styles of one artist:",
+    "       \"artists\": {",
+    "         \"Withered Throne\": { \"styles\": [\"Melodic Death Metal\"], \"note\": \"tag says only 'Metal'\" }",
+    "       }",
+    "",
+    "  2. Force the styles of one album (keyed by 'artist :: album'):",
+    "       \"albums\": {",
+    "         \"Kamelot :: The Awakening\": { \"styles\": [\"Power Metal\", \"Symphonic Metal\"] }",
+    "       }",
+    "",
+    "  3. Force (or clear) one single track (keyed by its path relative to the",
+    "     music root):",
+    "       \"tracks\": {",
+    "         \"Accept - Humanoid (2024)/01. Humanoid.mp3\": { \"styles\": [\"Heavy Metal\"] }",
+    "       }",
+    "",
+    "An empty style list means 'no style at all' - use it to push a track into",
+    "the 'unlabelled' bucket so it is never picked by a style filter.",
+    "",
+    "Style names must match data/styles.json. Run step4_normalize.py again",
+    "after editing this file; it re-applies the overrides to the whole library."
+  ],
+
+  "artists": {},
+  "albums": {},
+  "tracks": {}
+}

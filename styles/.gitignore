@@ -1,0 +1,15 @@
+# SimpleJellyMus styles/ - generated data only.
+#
+# Everything a step writes goes in here; the code, the vocabulary and the
+# hand-made rules/overrides are versioned in git. The database, the caches,
+# the downloaded models and the reports are not.
+
+out/
+models/
+
+# Local settings may hold an API key or a token - never stage them.
+config.local.json
+.env
+.env.*
+*.key
+*.token
