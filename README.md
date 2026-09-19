@@ -1,6 +1,6 @@
 # SimpleJellyMus
 
-A tiny desktop **random Jellyfin music player** written in Python, made for this
+A tiny desktop **random Jellyfin music player** written in Python, made for my
 machine (Manjaro / X11 / KDE, 1920x1080).
 
 It logs in **once**, then plays endless random **audio** tracks from your
@@ -11,8 +11,9 @@ and play/pause/next/previous controls.
 > Music only: the library query asks Jellyfin for `IncludeItemTypes=Audio`, every
 > item is validated (no videos, no music videos), and mpv runs with
 > `--no-video --vid=no --audio-display=no`. Video files are ignored entirely.
-
+<img width="1920" height="1080" alt="SJM_example" src="https://github.com/user-attachments/assets/c4e7cd1f-80eb-440f-a4dc-dc013e9b3ac8" />
 ---
+
 
 ## Requirements
 
@@ -29,7 +30,7 @@ Everything else is Python's standard library (`urllib`, `json`, `socket`,
 ## Install / run
 
 ```bash
-cd ~/CodebergProjects/simpleJellyMus
+cd simpleJellyMus
 python3 main.py
 ```
 
