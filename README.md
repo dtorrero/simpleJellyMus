@@ -6,7 +6,8 @@ machine (Manjaro / X11 / KDE, 1920x1080).
 It logs in **once**, then plays endless random **audio** tracks from your
 Jellyfin library, preloading the next song so there is no waiting between
 tracks. The screen shows the album cover, the song information, a progress bar
-and play/pause/next/previous controls.
+and play/pause/next/previous controls. If you want to steer it, press `G` and
+tell it to play only the styles you feel like (or everything *except* one).
 
 > Music only: the library query asks Jellyfin for `IncludeItemTypes=Audio`, every
 > item is validated (no videos, no music videos), and mpv runs with
@@ -14,8 +15,83 @@ and play/pause/next/previous controls.
 <img width="1920" height="1080" alt="SJM_example" src="https://github.com/user-attachments/assets/c4e7cd1f-80eb-440f-a4dc-dc013e9b3ac8" />
 ---
 
+## What it does
+
+SimpleJellyMus turns your Jellyfin library into a radio station that never
+stops: you tell it once which server and account to use, and from then on it
+just plays - one song after another, picked at random from your collection,
+with the cover art on screen and no silence between tracks.
+
+**The music**
+
+* Plays **music only**. Films, concerts and music videos in your library are
+  ignored on purpose, and mpv is told never to open a video window.
+* Never runs out: it keeps fetching new random songs for as long as you leave it on.
+* Doesn't loop the same few songs: recently played tracks are skipped and the
+  same artist is not played twice in a row.
+* No waiting between songs: the next track is downloaded in the background while
+  the current one plays, and handed to mpv so the two run into each other.
+* A broken file or a hiccup on the server never stops playback: it tells you
+  what happened and moves on to another song.
+
+**The window**
+
+* Album cover, song title, artist and album, plus a progress bar you can click
+  to jump anywhere in the song.
+* Play / pause, next, previous, restart, volume and seeking - as buttons and as
+  keys. Press `?` (or the **?** button, top right) to see every shortcut.
+* Windowed or fullscreen, and it remembers the size and mode you left it in.
+* Nothing on the screen ever jumps: a very long title shrinks and is shortened
+  with `…` instead of pushing the artwork, the progress bar or the buttons around.
+
+**Choosing what to hear** (optional - random is the default)
+
+* Press `G` to open the style panel: play only *Ska Punk*, only *Black Metal*,
+  a whole family such as *Metal*, or everything *except* *Schlager* once you have
+  had enough of it.
+* Tick as many styles as you like, then choose whether a song must match **any
+  of them**, **all of them** or **none of them**. Family buttons add a whole
+  branch in one click.
+* Searching tolerates typos (`trash metl` finds *Thrash Metal*), and the panel
+  always shows how many songs the current choice would play before you commit.
+* It never interrupts the song that is playing: a new choice takes effect from
+  the next track on.
+* The choice is remembered, so starting the app again plays the same way - and
+  `Clear` + `Play these` takes you straight back to plain random.
+
+**Things you don't have to think about**
+
+* You log in once. Your password is never stored; only an access token, in your
+  own config file (permissions `600`).
+* Starting the app a second time never gives you two players fighting over the
+  speakers: it brings the running window to the front instead.
+* It can live in your application menu with its own icon (`./install.sh`).
+* Nothing in your library is ever modified. The player only reads from Jellyfin,
+  and the style feature only reads a database file that it built on your machine.
+
+> The style feature is the only part that needs a one-time preparation step:
+> `python3 styles/prepare_styles.sh` (details in
+> [Play by style](#play-by-style) and `styles/README.md`). It is optional -
+> without it the player simply plays random songs from the whole library, and
+> everything above still works.
+
+**In this document:**
+[Requirements](#requirements) ·
+[Install / run](#install--run) ·
+[First run](#first-run) ·
+[Controls](#controls) ·
+[How it works](#how-it-works) ·
+[File layout](#file-layout) ·
+[Self-test](#self-test-no-jellyfin-server-needed) ·
+[Configuration and cache](#configuration-and-cache) ·
+[Troubleshooting](#troubleshooting) ·
+[Desktop app](#desktop-app)
 
 ## Requirements
+
+You need a **Jellyfin server you can reach** and an account on it; the app asks
+for the address and login the first time you start it (see
+[First run](#first-run)) and never asks again.
 
 | Component | Status on this machine |
 |---|---|
@@ -23,16 +99,31 @@ and play/pause/next/previous controls.
 | `mpv` (playback engine, used as an audio-only subprocess) | ✅ 0.41.0 |
 | Pillow (`PIL`) for cover art | ✅ 12.3.0 |
 
+Needing to install one of them? On this machine `sudo pacman -S mpv` and, on
+other distributions, `sudo apt install mpv python3-tk` or
+`sudo dnf install mpv python3-tkinter` are usually enough.
+
 Everything else is Python's standard library (`urllib`, `json`, `socket`,
 `threading`, `tkinter`). No `pip install` is required for the current setup
 (`requirements.txt` just documents the optional dependency).
 
+The optional **style catalog** needs no extra Python package either: it is built
+by the scripts in `styles/`, which do want `ffprobe` on your PATH and - only for
+the optional language-model step - a DeepSeek API key (see `styles/README.md`).
+The result is a single SQLite file of roughly 75 MB for a 41,000-track library.
+Playing needs none of that: the player only reads the finished file.
+
 ## Install / run
 
 ```bash
+git clone https://github.com/dtorrero/simpleJellyMus.git
 cd simpleJellyMus
 python3 main.py
 ```
+
+The first start asks for your Jellyfin address and login (see
+[First run](#first-run)); after that, starting the app means just running it and
+music begins. Closing the window (or `Q`, or the **Quit** button) stops it.
 
 Useful flags:
 
@@ -74,6 +165,25 @@ unknown name is refused with a suggestion instead of playing the wrong thing:
 $ python3 main.py --style "trash metl"
 Cannot filter by style: Unknown style 'trash metl' - did you mean 'Thrash Metal'?
 ```
+
+**Building the catalog** (once, optional):
+
+```bash
+cd simpleJellyMus
+python3 styles/prepare_styles.sh      # reads your music files -> catalog.sqlite
+```
+
+It takes a while for a big library and needs to see your music (the `styles/`
+folder explains how to point it at your files and at Jellyfin). It writes only
+`catalog.sqlite` plus a report in `styles/out/`: your music files, your Jellyfin
+server and the player's own settings are never modified, and the player opens
+the database **read-only**. Every step, and which of them are optional, is
+documented in `styles/README.md`.
+
+A selection made in the player with `G` is saved to the config file and restored
+on the next start, so you can keep a "normal" filter and only change it when you
+feel like it. `--style` overrides it for that single run, so a one-off
+`python3 main.py --style "Black Metal"` leaves your usual choice alone.
 
 The app starts **windowed** (remembering the size and fullscreen/windowed mode
 you used last time) and `Esc` switches between windowed and fullscreen.
@@ -167,6 +277,8 @@ Tkinter UI (ui.py) ──state snapshots── PlayerEngine (player.py)
                                           ├── MpvPlayer   mpv JSON IPC (audio only)
                                           ├── Preloader   next track -> disk cache
                                           ├── PlayQueue   random batches, no repeats
+                                          │     batches come from JellyfinClient (random)
+                                          │     or from catalog.py (when a style is picked)
                                           └── JellyfinClient (jellyfin.py) -> server
 ```
 
@@ -188,6 +300,13 @@ Tkinter UI (ui.py) ──state snapshots── PlayerEngine (player.py)
   always keep their place. A title that doesn't fit shrinks (25 pt down to a
   readable 15 pt) and is then ellipsized with `…`; the complete name is still in
   the window title.
+* **Play by style** changes only one thing: where the queue gets its random songs
+  from. Instead of asking Jellyfin for a batch, `catalog.py` reads the local
+  SQLite file (read-only) and returns a random batch of the matching tracks -
+  0.2-2 ms for a 41k-track library, where a random request to the server takes
+  about 2.5 s. The rest of the engine is untouched: the preloaded next track is
+  replaced only when a new selection rules it out, **Next** skips a song that is
+  queued but outside the filter, and **Previous** still walks your real history.
 * **One instance only**: `instance.py` binds a socket in `$XDG_RUNTIME_DIR`; a
   second start sends `focus` over it and exits, so the running window is brought
   to the front (un-minimised) instead of a second player being started that would
@@ -209,6 +328,7 @@ Tkinter UI (ui.py) ──state snapshots── PlayerEngine (player.py)
 | `player.py` | mpv IPC client, preloader cache, random play queue, engine |
 | `ui.py` | Tkinter login screen and fullscreen player UI (plus the `?` help and the style panel) |
 | `selftest.py` | offline self-test: fake Jellyfin server + generated audio (see below) |
+| `styles/` | the standalone builder that produces `catalog.sqlite` (scan → link → vocabulary → normalize → optional LLM → report); it is never used while playing |
 | `install.sh` | installs/removes the menu entry and the icon (see below) |
 | `simplejellymus.desktop` | launcher template (`@APPDIR@` is filled in by `install.sh`) |
 | `assets/fire_icon_variant_1.png` | application icon (1024×1024 master, installed in several sizes) |
@@ -218,17 +338,21 @@ Tkinter UI (ui.py) ──state snapshots── PlayerEngine (player.py)
 `selftest.py` starts a small fake Jellyfin server (with decoy video items),
 generates short WAV tracks, and verifies the whole pipeline: login, the
 music-only filter, cover download, the preload cache, gapless auto-advance,
-next/previous, pause, volume, seeking, the UI layout (long titles), the
-style catalog (search, families, `any`/`all`/`not`, filtered queues) and the
-single-instance guard.
+next/previous, pause, volume, seeking, the UI layout (long titles never move
+anything), the `?` help card, the style panel (search, family chips,
+`any`/`all`/`not`, applying and cancelling a choice, the "nothing matches" case,
+recalling the last choice), the catalog queries themselves, and the
+single-instance guard - **over 200 checks**, all offline.
 
 ```bash
 python3 selftest.py            # ~1 minute, silent (volume 0)
 python3 -u selftest.py | tail -5
 ```
 
-It writes everything to a throwaway directory, so your real login and library
-are never touched. Set `SELFTEST_DEBUG=1` for verbose mpv logging.
+It writes everything to a throwaway directory, so your real login, library and
+style database are never touched. Set `SELFTEST_DEBUG=1` for verbose mpv logging.
+A freshly built `catalog.sqlite` is not required: the checks build their own
+tiny one.
 
 
 ## Configuration and cache
@@ -238,6 +362,7 @@ are never touched. Set `SELFTEST_DEBUG=1` for verbose mpv logging.
 | `~/.config/simplejellymus/config.json` | server URL, username, access token, user id, device id, volume, window mode and size, and the style filter picked with `G` |
 | `~/.cache/simplejellymus/audio/` | preloaded (next) tracks, pruned automatically |
 | `~/.cache/simplejellymus/covers/` | album art cache |
+| `~/.local/share/simplejellymus/catalog.sqlite` | the style dataset (only if you built it with `styles/`); opened read-only, the player never writes to it |
 | `$XDG_RUNTIME_DIR/simplejellymus.sock` | single-instance guard (removed when the app quits) |
 | `~/.local/share/applications/simplejellymus.desktop` | menu entry created by `install.sh` |
 | `~/.local/share/icons/hicolor/<size>x<size>/apps/simplejellymus.png` | icon installed by `install.sh` (one copy per size) |
@@ -247,11 +372,16 @@ repository itself ever holds your credentials — the token only lives in the co
 file above (mode `600`), and `.gitignore` additionally refuses to stage a stray
 `config.json`, `*.token` or `*.log`.
 
+To get rid of a style filter, press `G` in the player and use `Clear` →
+`Play these`; that clears the saved entry too. If a saved style has disappeared
+from the catalog, the player says `ignoring the style filter` when it starts and
+simply plays random songs - a stale config never keeps the music from starting.
+
 ## Troubleshooting
 
 | Symptom | Fix |
 |---|---|
-| `mpv was not found in PATH` | `sudo pacman -S mpv` |
+| `mpv was not found in PATH` | `sudo pacman -S mpv` (or `sudo apt install mpv` / `sudo dnf install mpv`) |
 | Starting it again does nothing but print "already running" | that is the single-instance guard: it focuses the running window instead |
 | `--reset-login` says "already running" | quit the player first; the guard will not delete the login of a running instance |
 | "Cannot reach ..." on start | the Jellyfin server is down or the URL is wrong; fix it with **Change account** |
@@ -259,6 +389,13 @@ file above (mode `600`), and `.gitignore` additionally refuses to stage a stray
 | No sound | check the sink with `pactl list short sinks`; mpv uses `--ao=pulse,alsa` |
 | A track fails to decode | the player skips it and continues with the next random song |
 | Covers missing | the library has no artwork for that release; a placeholder is shown |
+| `G` shows "No style catalog yet" | the dataset was never built: run `python3 styles/prepare_styles.sh` once (see `styles/README.md`). Until then the player plays random songs from the whole library |
+| It only plays one style and you never asked for it | a choice made with `G` is remembered across restarts: press `G`, pick something else, or `Clear` → `Play these` for plain random |
+| A saved style no longer exists in the catalog | the player prints `[engine] ignoring the style filter: …` at start and keeps playing; choose a new one with `G` |
+| `--style` prints "Unknown style … did you mean …?" | the name is not in the catalog: use the suggested name, or `family:Name` for a whole family |
+| `--style` prints "matches no tracks" | that combination is empty (for example `all` of two unrelated styles): remove one of them, or switch to `any` |
+| Filtered playback repeats the same songs | the selection is small by nature; add another style or a family (the panel shows the count before you commit) |
+| Can't find a style in the panel | type part of the name - the search also looks at aliases (`outrun` finds *Synthwave*) and forgives typos |
 
 ## Desktop app
 
