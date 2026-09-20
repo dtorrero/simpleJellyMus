@@ -243,9 +243,9 @@ saved). On the next start the player goes straight to the music.
 | `F` | switch windowed ⇄ fullscreen |
 | `Q` (or `Ctrl+Q`) | quit |
 
-The on-screen buttons do the same: click the cover art area's transport
-buttons, or click the progress bar to seek; **Change account** and **Quit** sit
-in the top right next to **?**.
+The on-screen buttons do the same: the transport row under the cover art, the
+progress bar (click or drag it to seek), and **Change account** / **Quit** /
+**?** in the top right, next to the app name.
 
 ### Play by style in the player
 
