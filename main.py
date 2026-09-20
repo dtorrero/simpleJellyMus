@@ -38,6 +38,7 @@ from jellyfin import AuthError, JellyfinClient, JellyfinError
 from player import PlayerEngine, PlayerError
 from ui import (BACKGROUND, CARD, CARD_LIGHT, DANGER, MUTED, TEXT, WINDOW_SIZE, LoginFrame,
                 PlayerScreen, pick_font_family)
+import catalog as catalog_module
 
 GEOMETRY_RE = re.compile(r"^(\d{3,5})x(\d{3,5})$")
 MIN_WINDOW_SIZE = (900, 620)
@@ -60,6 +61,16 @@ class Application:
         self.debug = bool(options.debug)
         self.family = pick_font_family()
         self.config: Dict[str, Any] = jellyfin.load_config() or {}
+        # The style catalog (optional): with it the player can filter by style,
+        # without it everything behaves exactly as it always has.
+        self.catalog = catalog_module.open_catalog(
+            getattr(options, "catalog", "") or None, debug=self.debug)
+        self.style_filter: List[str] = list(getattr(options, "style", []) or [])
+        self.style_mode: str = getattr(options, "style_mode", "") or "any"
+        # Without --style the filter picked last time is restored, so the choice
+        # survives a restart (G in the player shows and changes it).
+        if not self.style_filter:
+            self.style_filter, self.style_mode = saved_style_filter(self.config)
         self.client: Optional[JellyfinClient] = None
         self.engine: Optional[PlayerEngine] = None
         self.frame: Optional[tk.Widget] = None
@@ -161,6 +172,15 @@ class Application:
             except (tk.TclError, ValueError):
                 pass
         self._save_job = self.root.after(600, self._write_window_state)
+
+    def _save_style_filter(self, entries, mode: str) -> None:
+        """Remember the style selection the user made in the player."""
+        self.style_filter = [str(entry) for entry in entries or []]
+        self.style_mode = mode if mode in ("any", "all", "not") else "any"
+        config = dict(self.config)
+        config["style_filter"] = {"entries": list(self.style_filter), "mode": self.style_mode}
+        self.config = config
+        jellyfin.save_config(config)
 
     def _has_login(self) -> bool:
         return bool(self.config.get("server_url") and self.config.get("access_token"))
@@ -299,7 +319,9 @@ class Application:
         self.client = client
         try:
             self.engine = PlayerEngine(client, volume=int(self.config.get("volume", 80)),
-                                       debug=self.debug)
+                                       debug=self.debug, catalog=self.catalog,
+                                       style_filter=self.style_filter,
+                                       style_mode=self.style_mode)
             self.engine.start()
         except PlayerError as exc:
             messagebox.showerror("SimpleJellyMus", str(exc))
@@ -315,6 +337,8 @@ class Application:
                 on_quit=self.shutdown,
                 windowed_geometry=self._windowed_geometry(),
                 on_window_state_change=self._remember_window,
+                catalog=self.catalog,
+                on_style_change=self._save_style_filter,
                 debug=self.debug,
             )
         )
@@ -369,6 +393,13 @@ def parse_args(argv):
     parser.add_argument("--fullscreen", action="store_true",
                         help="start in fullscreen (Esc switches between both)")
     parser.add_argument("--debug", action="store_true", help="verbose Jellyfin/mpv logging")
+    parser.add_argument("--style", action="append", default=[], metavar="STYLE",
+                        help="only play this style (repeatable, e.g. --style \"Black Metal\";"
+                             " \"family:Metal\" selects a whole family)")
+    parser.add_argument("--style-mode", default="", choices=["", "any", "all", "not"],
+                        help="how several styles combine: any (default), all, not")
+    parser.add_argument("--catalog", default="", metavar="PATH",
+                        help="style catalog database (default: the one styles/ built)")
     return parser.parse_args(argv)
 
 
@@ -392,8 +423,51 @@ def install_signal_handlers(app: "Application") -> None:
             pass
 
 
+def saved_style_filter(config: Dict[str, Any]) -> Tuple[List[str], str]:
+    """The style filter remembered from a previous session.
+
+    Returns ``([], "any")`` for anything missing or damaged, so a stale config
+    file can never stop the player from starting.
+    """
+    saved = (config or {}).get("style_filter") or {}
+    if not isinstance(saved, dict):
+        return [], "any"
+    entries = [str(entry) for entry in (saved.get("entries") or []) if entry]
+    mode = str(saved.get("mode") or "any")
+    return entries, (mode if mode in ("any", "all", "not") else "any")
+
+
+def validate_style_request(options) -> int:
+    """Check ``--style`` before the window opens (a clear message beats a half start)."""
+    entries = list(getattr(options, "style", []) or [])
+    if not entries:
+        return 0
+    catalog = catalog_module.open_catalog(options.catalog or None, debug=options.debug)
+    if catalog is None:
+        print("Cannot filter by style: no catalog yet.\n"
+              "  build one with:  python3 styles/prepare_styles.sh\n"
+              "  (or point --catalog at an existing catalog.sqlite)", file=sys.stderr)
+        return 2
+    try:
+        ids, families = catalog.resolve(entries)
+    except JellyfinError as exc:
+        print(f"Cannot filter by style: {exc}", file=sys.stderr)
+        return 2
+    mode = options.style_mode or "any"
+    if not catalog.count(ids, families, mode):
+        print(f"Cannot filter by style: {', '.join(entries)} ({mode}) matches no tracks",
+              file=sys.stderr)
+        return 2
+    print(f"Style filter: {', '.join(entries)} ({mode})")
+    return 0
+
+
 def main(argv=None) -> int:
     options = parse_args(sys.argv[1:] if argv is None else argv)
+
+    status = validate_style_request(options)
+    if status:
+        return status
 
     # Only one copy may run: a second start asks the running window to come to
     # the front and exits (this is also what a double-click on the launcher does).

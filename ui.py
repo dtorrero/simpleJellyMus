@@ -11,7 +11,7 @@ import queue
 import threading
 import tkinter as tk
 from tkinter import font as tkfont
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageTk
 
@@ -41,6 +41,25 @@ STATUS_SIZE = 10
 MIN_COVER, MAX_COVER = 200, 560
 CHROME_MARGIN = 26            # breathing room kept around the fixed blocks
 FOOTER_PAD = (28, 18)         # horizontal / bottom padding of the footer
+
+# How a key is spelled in the "?" overlay. The bindings themselves live in
+# PlayerScreen._SHORTCUTS, and the help is rendered from that same table, so the
+# text can never drift from what the keys really do.
+KEY_LABELS = {
+    "<space>": "Space", "<Right>": "→", "<Left>": "←", "<Up>": "↑", "<Down>": "↓",
+    "<Button-4>": "wheel ↑", "<Button-5>": "wheel ↓", "<comma>": ",", "<period>": ".",
+    "<question>": "?", "<Shift-slash>": "?", "<Control-q>": "Ctrl+Q",
+}
+
+
+def key_label(sequence: str) -> str:
+    """A short, readable name for a Tk event sequence."""
+    if sequence in KEY_LABELS:
+        return KEY_LABELS[sequence]
+    label = sequence[1:-1]
+    if label.startswith("Shift-"):
+        return label[len("Shift-"):].upper()
+    return label.upper() if len(label) == 1 else label.title()
 
 
 def pick_font_family() -> str:
@@ -283,10 +302,15 @@ class PlayerScreen(ThreadSafeFrame):
                  on_change_account: Callable[[], None], on_quit: Callable[[], None],
                  windowed_geometry: str = WINDOW_SIZE,
                  on_window_state_change: Optional[Callable[[], None]] = None,
+                 catalog: Any = None,
+                 on_style_change: Optional[Callable[[List[str], str], None]] = None,
                  debug: bool = False) -> None:
         super().__init__(master, bg=BACKGROUND)
         self.engine = engine
         self.client = client
+        # The optional style catalog: it only feeds the "play by style" panel.
+        self.catalog = catalog
+        self._on_style_change = on_style_change
         self.family = family or pick_font_family()
         self._on_change_account = on_change_account
         self._on_quit = on_quit
@@ -311,6 +335,10 @@ class PlayerScreen(ThreadSafeFrame):
         self._up_next_raw = ""
         self._status_raw = ""
         self._account_raw = ""
+        # A transient card ("?" help, style picker) placed over the screen. It is
+        # never packed, so it cannot move anything in the fixed layout.
+        self._overlay: Optional[tk.Frame] = None
+        self._overlay_job: Optional[str] = None
         # Height of the immovable chrome, measured once the widgets exist.
         self._chrome_height = 0
         self._text_block_height = 120
@@ -506,6 +534,8 @@ class PlayerScreen(ThreadSafeFrame):
         self._account_width = max(120, width - 2 * FOOTER_PAD[0] - 520)
         self._apply_text(*self._current_text)
         self._refresh_footer()
+        if self._overlay is not None:      # a card follows the window size
+            self._place_overlay()
         if resized:
             self._update_cover(self._state.get("current"))
 
@@ -598,6 +628,12 @@ class PlayerScreen(ThreadSafeFrame):
                   borderwidth=0, bg=CARD_LIGHT, fg=TEXT, activebackground=CARD, activeforeground=TEXT,
                   font=(self.family, 10, "bold"), padx=14, pady=6,
                   cursor="hand2").pack(side="right")
+        # The keyboard help. Same font and padding as its neighbours, so the
+        # header keeps its height (and the artwork keeps its size).
+        tk.Button(self._header, text="?", command=self._open_help, relief="flat", borderwidth=0,
+                  bg=CARD_LIGHT, fg=TEXT, activebackground=CARD, activeforeground=TEXT,
+                  font=(self.family, 10, "bold"), padx=14, pady=6,
+                  cursor="hand2").pack(side="right", padx=(0, 8))
 
     # ---------------------------------------------------------------- progress
     def _build_progress(self, parent: tk.Misc) -> None:
@@ -761,6 +797,19 @@ class PlayerScreen(ThreadSafeFrame):
     def _seek_relative(self, delta: float) -> None:
         self._run(self.engine.seek_relative, delta)
 
+    def _volume_up(self) -> None:
+        """Named so the shortcut table (and the "?" overlay) can point at it."""
+        self._volume(5)
+
+    def _volume_down(self) -> None:
+        self._volume(-5)
+
+    def _seek_back(self) -> None:
+        self._seek_relative(-10.0)
+
+    def _seek_forward(self) -> None:
+        self._seek_relative(10.0)
+
     def _toggle_fullscreen(self) -> None:
         """Switch between fullscreen and the windowed size (Esc or F)."""
         root = self.winfo_toplevel()
@@ -776,35 +825,63 @@ class PlayerScreen(ThreadSafeFrame):
         self._notify_window_state()
 
     # ------------------------------------------------------------------- input
+    # Every key the player reacts to, in one place: the "?" overlay is rendered
+    # from this table, so the help can never drift from the real bindings.
+    # Entries are (method name, event sequences, text shown in the help).
+    _SHORTCUTS: Tuple[Tuple[str, Tuple[str, ...], str], ...] = (
+        ("_toggle", ("<space>",), "play / pause"),
+        ("_next", ("<Right>", "<n>", "<N>"), "next song"),
+        ("_previous", ("<Left>", "<p>", "<P>"), "previous song (in the first 5 s)"),
+        ("_volume_up", ("<Up>", "<Button-4>"), "volume up"),
+        ("_volume_down", ("<Down>", "<Button-5>"), "volume down"),
+        ("_seek_back", ("<comma>",), "back 10 seconds"),
+        ("_seek_forward", ("<period>",), "forward 10 seconds"),
+        ("_restart", ("<s>", "<S>"), "restart the song"),
+        ("_toggle_fullscreen", ("<f>", "<F>"), "windowed ⇄ fullscreen"),
+        ("_open_style_picker", ("<g>", "<G>"), "play by style…"),
+        ("_open_help", ("<question>", "<Shift-slash>"), "this help"),
+        ("_on_quit", ("<q>", "<Q>", "<Control-q>"), "quit"),
+    )
+    # Esc is bound unwrapped: it must work while an overlay (or its text field)
+    # has the focus, and closing an overlay wins over toggling fullscreen.
+    _ESC_HELP = ("Esc", "close the help / style picker  ·  or fullscreen")
+
     def _bind_shortcuts(self) -> None:
         root = self.winfo_toplevel()
-        shortcuts = (
-            ("<space>", self._toggle),
-            ("<Right>", self._next), ("<n>", self._next), ("<N>", self._next),
-            ("<Left>", self._previous), ("<p>", self._previous), ("<P>", self._previous),
-            ("<Up>", lambda: self._volume(5)), ("<Down>", lambda: self._volume(-5)),
-            ("<Button-4>", lambda: self._volume(5)), ("<Button-5>", lambda: self._volume(-5)),
-            ("<s>", self._restart), ("<S>", self._restart),
-            ("<comma>", lambda: self._seek_relative(-10.0)),
-            ("<period>", lambda: self._seek_relative(10.0)),
-            ("<f>", self._toggle_fullscreen), ("<F>", self._toggle_fullscreen),
-            ("<Escape>", self._toggle_fullscreen),
-            ("<Control-q>", self._on_quit), ("<q>", self._on_quit), ("<Q>", self._on_quit),
-        )
-        for sequence, handler in shortcuts:
-            try:
-                self._bindings.append((sequence, root.bind(sequence, self._wrap(handler), add="+")))
-            except tk.TclError:
-                pass
+        for name, sequences, _help in self._SHORTCUTS:
+            handler = getattr(self, name, None)
+            if handler is None:          # a row that has no implementation yet
+                continue
+            for sequence in sequences:
+                try:
+                    self._bindings.append(
+                        (sequence, root.bind(sequence, self._wrap(handler), add="+")))
+                except tk.TclError:
+                    pass
+        try:
+            self._bindings.append(("<Escape>", root.bind("<Escape>", self._on_escape, add="+")))
+        except tk.TclError:
+            pass
         self._focus_job = self.after(150, self._grab_focus)
 
-    def _wrap(self, handler: Callable[[], None]) -> Callable[[Any], None]:
-        """Ignore shortcuts while a text/button widget has the focus."""
+    def _on_escape(self, event: Any = None) -> Optional[str]:
+        """Esc closes an overlay; with nothing open it toggles fullscreen."""
+        if self._overlay is not None:
+            self._close_overlay()
+            return "break"
+        self._toggle_fullscreen()
+        return None
+
+    def _wrap(self, handler: Callable[[], Any]) -> Callable[[Any], Any]:
+        """Ignore shortcuts while a text/button widget - or an overlay - is active."""
         def dispatch(event: Any):
+            if self._overlay is not None:
+                # The overlay owns the keyboard: without this, arrowing through a
+                # list would move its cursor *and* change the volume.
+                return None
             if isinstance(event.widget, (tk.Entry, tk.Text, tk.Button)):
                 return None
-            handler()
-            return None
+            return handler()
         return dispatch
 
     def _grab_focus(self) -> None:
@@ -829,7 +906,7 @@ class PlayerScreen(ThreadSafeFrame):
         except tk.TclError:
             pass
         self._bindings = []
-        for name in ("_resize_job", "_focus_job"):
+        for name in ("_resize_job", "_focus_job", "_overlay_job"):
             job = getattr(self, name, None)
             if job is not None:
                 try:
@@ -838,10 +915,160 @@ class PlayerScreen(ThreadSafeFrame):
                     pass
                 setattr(self, name, None)
         try:
+            if self._overlay is not None:
+                self._close_overlay()
+        except tk.TclError:
+            pass
+        try:
             self._actions.put((None, ()))     # stop the action worker
         except Exception:
             pass
         super().destroy()
+
+    # ------------------------------------------------------------------ overlays
+    def _overlay_size(self) -> Tuple[int, int]:
+        """Card size for the current window (always inside the window)."""
+        width = self.winfo_width() or 1280
+        height = self.winfo_height() or 800
+        return int(max(460, min(900, width - 120))), int(max(380, min(640, height - 140)))
+
+    def _place_overlay(self) -> None:
+        if self._overlay is None:
+            return
+        width, height = self._overlay_size()
+        self._overlay.place(relx=0.5, rely=0.5, anchor="center", width=width, height=height)
+
+    def _open_overlay(self, heading: str, build: Callable[[tk.Frame], None]) -> tk.Frame:
+        """Show a modal card centred over the screen.
+
+        The card is *placed*, never packed, so it takes no space in the layout:
+        the artwork, the progress bar, the transport and the footer keep exactly
+        the geometry they have when it is closed.
+        """
+        self._close_overlay()
+        card = tk.Frame(self, bg=CARD, highlightthickness=1, highlightbackground=CARD_LIGHT,
+                        padx=20, pady=14)
+        title = tk.Frame(card, bg=CARD)
+        title.pack(fill="x")
+        tk.Label(title, text=heading, bg=CARD, fg=TEXT,
+                 font=(self.family, 14, "bold")).pack(side="left")
+        tk.Button(title, text="✕", command=self._close_overlay, relief="flat", borderwidth=0,
+                  bg=CARD, fg=MUTED, activebackground=CARD_LIGHT, activeforeground=TEXT,
+                  font=(self.family, 12, "bold"), padx=6, pady=0,
+                  cursor="hand2").pack(side="right")
+        body = tk.Frame(card, bg=CARD)
+        body.pack(fill="both", expand=True, pady=(12, 0))
+        self._overlay = card
+        build(body)
+        self._place_overlay()
+        card.lift()
+        return card
+
+    def _close_overlay(self) -> None:
+        """Dismiss the card (Esc, ✕ or a finished action)."""
+        card, self._overlay = self._overlay, None
+        if self._overlay_job is not None:
+            try:
+                self.after_cancel(self._overlay_job)
+            except (tk.TclError, ValueError):
+                pass
+            self._overlay_job = None
+        if card is not None:
+            try:
+                card.place_forget()
+                card.destroy()
+            except tk.TclError:
+                pass
+        if self._alive:
+            # Give the keyboard back to the player (a clicked button would keep
+            # the focus, and then the shortcuts would look dead).
+            try:
+                self._overlay_job = self.after(120, self._grab_focus_if_idle)
+            except tk.TclError:
+                self._overlay_job = None
+
+    def _grab_focus_if_idle(self) -> None:
+        """Return the focus to the window, unless a card opened in the meantime."""
+        self._overlay_job = None
+        if self._alive and self._overlay is None:
+            self._grab_focus()
+
+    def _open_help(self) -> None:
+        """The "?" card: every key, straight from the shortcut table."""
+        def build(body: tk.Frame) -> None:
+            grid = tk.Frame(body, bg=CARD)
+            grid.pack(fill="both", expand=True)
+            for index, (keys, description) in enumerate(self._help_rows()):
+                tk.Label(grid, text=keys, bg=CARD, fg=TEXT, font=(self.family, 10, "bold"),
+                         anchor="e").grid(row=index, column=0, sticky="e", padx=(0, 16), pady=1)
+                tk.Label(grid, text=description, bg=CARD, fg=MUTED, font=(self.family, 10),
+                         anchor="w").grid(row=index, column=1, sticky="w", pady=1)
+            tk.Label(body, text="Esc closes this", bg=CARD, fg=MUTED,
+                     font=(self.family, 9)).pack(side="bottom", anchor="e")
+        self._open_overlay("Keyboard shortcuts", build)
+
+    def _help_rows(self) -> List[Tuple[str, str]]:
+        """``(keys, description)`` pairs for the help, from the real bindings."""
+        rows: List[Tuple[str, str]] = []
+        for name, sequences, description in self._SHORTCUTS:
+            if getattr(self, name, None) is None:      # not implemented yet
+                continue
+            labels = list(dict.fromkeys(key_label(sequence) for sequence in sequences))
+            rows.append((" / ".join(labels), description))
+        rows.append(self._ESC_HELP)
+        return rows
+
+    # ------------------------------------------------------------- style picker
+    def _open_style_picker(self) -> None:
+        """The "play by style" card (G), or an explanation when there is no dataset."""
+        if self.catalog is None or not self.catalog.available():
+            self._open_overlay("Play by style", self._build_no_catalog)
+            return
+
+        def build(body: tk.Frame) -> None:
+            try:
+                current = (self.engine.snapshot() or {}).get("filter") or {}
+            except Exception:                  # a stub engine without a filter
+                current = {}
+            width, _height = self._overlay_size()
+            picker = StylePicker(body, catalog=self.catalog, font_family=self.family,
+                                 selection=current.get("entries") or [],
+                                 mode=str(current.get("mode") or "any"),
+                                 on_apply=self._apply_style, on_close=self._close_overlay,
+                                 width=width - 52)
+            picker.pack(fill="both", expand=True)
+            picker.focus_search()
+
+        self._open_overlay("Play by style", build)
+
+    def _build_no_catalog(self, body: tk.Frame) -> None:
+        """What the card says when the dataset has not been built yet."""
+        tk.Label(body, text="No style catalog yet.", bg=CARD, fg=TEXT,
+                 font=(self.family, 11, "bold")).pack(anchor="w")
+        tk.Label(body, text="Build it once from the project folder:\n\n"
+                            "    python3 styles/prepare_styles.sh\n\n"
+                            "then start the player again. Until then the player keeps\n"
+                            "picking random songs from the whole library.",
+                 bg=CARD, fg=MUTED, justify="left", font=(self.family, 10)).pack(anchor="w",
+                                                                                 pady=(8, 0))
+
+    def _apply_style(self, entries: List[str], mode: str) -> Optional[str]:
+        """Apply a picker selection: the engine first, then the app persists it.
+
+        Returns ``None`` (the panel closes) or a message to show inline.
+        """
+        try:
+            # The action thread keeps the Tk loop free while the engine re-checks
+            # the preloaded track (and maybe replaces it).
+            self._run(self.engine.set_style_filter, list(entries), mode)
+        except Exception as exc:
+            return str(exc)
+        if self._on_style_change is not None:
+            try:
+                self._on_style_change(list(entries), mode)
+            except Exception as exc:
+                print(f"[ui] could not save the style filter: {exc}", flush=True)
+        return None
 
 
     # ------------------------------------------------------------ state updates
@@ -962,6 +1189,439 @@ class PlayerScreen(ThreadSafeFrame):
             return
         self._cover_image = photo
         self._cover_label.configure(image=photo)
+
+
+class StylePicker(tk.Frame):
+    """The "play by style" panel: search, families, styles, mode and the count.
+
+    It never touches the engine itself - the chosen selection is handed to
+    *on_apply*, which returns an error message to show inline (or ``None`` when
+    it worked). Everything is local and read-only, so typing can never disturb
+    what is playing.
+    """
+
+    ROW_BG = CARD_LIGHT
+    ROW_CURSOR = "#383d42"
+    ROW_SELECTED = ACCENT
+    ROW_SELECTED_CURSOR = ACCENT_LIGHT
+
+    def __init__(self, master: tk.Misc, *, catalog: Any, font_family: str = "",
+                 selection: Any = (), mode: str = "any",
+                 on_apply: Optional[Callable[[List[str], str], Optional[str]]] = None,
+                 on_close: Optional[Callable[[], None]] = None,
+                 width: int = 820) -> None:
+        super().__init__(master, bg=CARD)
+        self.catalog = catalog
+        self.family = font_family or pick_font_family()
+        self._on_apply = on_apply
+        self._on_close = on_close
+        self._selected_styles: set = set()
+        self._selected_families: set = set()
+        self._mode = mode if mode in ("any", "all", "not") else "any"
+        self._results: List[Dict[str, Any]] = []
+        self._cursor = 0
+        self._updating = False
+        self._search_job: Optional[str] = None
+        self._width = max(320, int(width))
+        self._library_total: Optional[int] = None
+        self._load_selection(selection)
+        self._build()
+        self._reload()
+
+    # ------------------------------------------------------------------- setup
+    def _load_selection(self, selection: Any) -> None:
+        for entry in selection or []:
+            text = str(entry).strip()
+            if not text:
+                continue
+            if text.lower().startswith("family:"):
+                self._selected_families.add(text.split(":", 1)[1].strip())
+            else:
+                self._selected_styles.add(text)
+
+    def entries(self) -> List[str]:
+        """The selection in the form the engine and the config use."""
+        return ([f"family:{name}" for name in sorted(self._selected_families)]
+                + sorted(self._selected_styles))
+
+    def _build(self) -> None:
+        self._build_search()
+        self._build_modes()
+        self._build_chips()
+        self._build_list()
+        self._build_footer()
+
+    def _button(self, parent: tk.Misc, text: str, command: Callable[[], None],
+                bg: str = CARD_LIGHT) -> tk.Button:
+        return tk.Button(parent, text=text, command=command, relief="flat", borderwidth=0,
+                         bg=bg, fg=TEXT, activebackground=CARD, activeforeground=TEXT,
+                         font=(self.family, 10, "bold"), padx=14, pady=5, cursor="hand2")
+
+    def _build_search(self) -> None:
+        row = tk.Frame(self, bg=CARD)
+        row.pack(fill="x")
+        tk.Label(row, text="Search", bg=CARD, fg=MUTED, font=(self.family, 10)).pack(side="left",
+                                                                                     padx=(0, 8))
+        self._query = tk.StringVar()
+        self._entry = tk.Entry(row, textvariable=self._query, bg=CARD_LIGHT, fg=TEXT,
+                               insertbackground=TEXT, relief="flat", bd=0, font=(self.family, 12),
+                               highlightthickness=1, highlightbackground=CARD_LIGHT,
+                               highlightcolor=ACCENT)
+        self._entry.pack(side="left", fill="x", expand=True, ipady=5)
+        self._entry.bind("<KeyRelease>", self._on_typing)
+        self._entry.bind("<Down>", lambda _e: (self._focus_row(0), "break")[1])
+        self._entry.bind("<Up>", lambda _e: (self._focus_row(-1), "break")[1])
+        self._entry.bind("<Return>", lambda _e: (self._apply(True), "break")[1])
+        self._entry.bind("<Escape>", lambda _e: (self._close(), "break")[1])
+
+    def _build_modes(self) -> None:
+        row = tk.Frame(self, bg=CARD)
+        row.pack(fill="x", pady=(10, 0))
+        tk.Label(row, text="Match", bg=CARD, fg=MUTED, font=(self.family, 10)).pack(side="left",
+                                                                                    padx=(0, 8))
+        self._mode_buttons: Dict[str, tk.Button] = {}
+        for mode, label in (("any", "any of"), ("all", "all of"), ("not", "not")):
+            button = self._button(row, label, lambda m=mode: self._set_mode(m))
+            button.pack(side="left", padx=(0, 6))
+            self._mode_buttons[mode] = button
+        self._mode_hint = tk.Label(row, text="", bg=CARD, fg=MUTED, font=(self.family, 9))
+        self._mode_hint.pack(side="right")
+        self._paint_modes()
+
+    def _build_chips(self) -> None:
+        """One clickable chip per family, wrapped to the panel width."""
+        self._chips = tk.Frame(self, bg=CARD)
+        self._chips.pack(fill="x", pady=(10, 0))
+        self._chip_buttons: Dict[str, tk.Button] = {}
+        # Measured up front: a widget can only be packed into its own master, so
+        # the row a chip belongs to has to be known before creating it.
+        font = tkfont.Font(family=self.family, size=9)
+        row, used = self._chips, 0
+        for family in self.catalog.families():
+            name = str(family["name"])
+            label = f"{name} {int(family.get('tracks') or 0):,}"
+            needed = font.measure(label) + 2 * 8 + 6 + 6      # padding + gap
+            if used and used + needed > self._width:
+                row = tk.Frame(self._chips, bg=CARD)
+                row.pack(anchor="w", pady=(4, 0))
+                used = 0
+            button = tk.Button(row, text=label, command=lambda n=name: self._toggle_family(n),
+                               relief="flat", borderwidth=0, bg=CARD_LIGHT, fg=TEXT,
+                               activebackground=CARD, activeforeground=TEXT, font=(self.family, 9),
+                               padx=8, pady=2, cursor="hand2")
+            button.pack(side="left", padx=(0, 6))
+            used += needed
+            self._chip_buttons[name] = button
+        self._paint_chips()
+
+    def _build_list(self) -> None:
+        row = tk.Frame(self, bg=CARD)
+        row.pack(fill="both", expand=True, pady=(10, 0))
+        self._list = tk.Listbox(row, selectmode="multiple", activestyle="none", bd=0,
+                                highlightthickness=0, exportselection=False,
+                                bg=self.ROW_BG, fg=TEXT, selectbackground=self.ROW_SELECTED,
+                                selectforeground=TEXT, font=(self.family, 11))
+        scroll = tk.Scrollbar(row, command=self._list.yview, bg=CARD_LIGHT, troughcolor=CARD,
+                              activebackground=ACCENT, relief="flat", bd=0, width=12)
+        self._list.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        self._list.pack(side="left", fill="both", expand=True)
+        # Every click is handled here (and swallowed) so the list can never own
+        # the selection: the panel keeps the selection in its own sets, which is
+        # what makes filtering the list harmless.
+        self._list.bind("<Button-1>", self._on_click)
+        self._list.bind("<Double-Button-1>", lambda _e: (self._apply(), "break")[1])
+        self._list.bind("<Down>", lambda _e: (self._move_cursor(1), "break")[1])
+        self._list.bind("<Up>", lambda _e: (self._move_cursor(-1), "break")[1])
+        self._list.bind("<space>", lambda _e: (self._toggle_cursor(), "break")[1])
+        self._list.bind("<Return>", lambda _e: (self._apply(True), "break")[1])
+        self._list.bind("<Escape>", lambda _e: (self._close(), "break")[1])
+
+    def _build_footer(self) -> None:
+        self._details = tk.Label(self, text="", bg=CARD, fg=MUTED, font=(self.family, 9),
+                                 anchor="w", justify="left")
+        self._details.pack(fill="x", pady=(6, 0))
+        self._message = tk.Label(self, text="", bg=CARD, fg=DANGER, font=(self.family, 9),
+                                 anchor="w")
+        self._message.pack(fill="x")
+        row = tk.Frame(self, bg=CARD)
+        row.pack(fill="x", pady=(8, 0))
+        self._summary = tk.Label(row, text="", bg=CARD, fg=TEXT, font=(self.family, 10),
+                                 anchor="w")
+        self._summary.pack(side="left")
+        self._play = self._button(row, "Play these", self._apply, bg=ACCENT)
+        self._play.pack(side="right")
+        self._button(row, "Cancel", self._close).pack(side="right", padx=(0, 8))
+        self._button(row, "Clear", self._clear).pack(side="right", padx=(0, 8))
+
+    def focus_search(self) -> None:
+        """Typing filters straight away when the panel opens."""
+        try:
+            self._entry.focus_set()
+        except tk.TclError:
+            pass
+
+    # ------------------------------------------------------------------ painting
+    def _paint_modes(self) -> None:
+        hints = {"any": "a track needs at least one of them",
+                 "all": "a track needs every one of them",
+                 "not": "a track must have none of them"}
+        for mode, button in self._mode_buttons.items():
+            active = mode == self._mode
+            button.configure(bg=ACCENT if active else CARD_LIGHT,
+                             activebackground=ACCENT_LIGHT if active else CARD)
+        self._mode_hint.configure(text=hints[self._mode])
+
+    def _paint_chips(self) -> None:
+        for name, button in self._chip_buttons.items():
+            chosen = name in self._selected_families
+            button.configure(bg=ACCENT if chosen else CARD_LIGHT,
+                             activebackground=ACCENT_LIGHT if chosen else CARD)
+
+    def _paint_rows(self) -> None:
+        """Show the selection and the cursor on the rows of the current list."""
+        self._updating = True
+        try:
+            for index in range(len(self._results)):
+                chosen = self._is_selected(self._entry_for_row(index))
+                if chosen:
+                    self._list.selection_set(index)
+                else:
+                    self._list.selection_clear(index)
+                if chosen and index == self._cursor:
+                    background = self.ROW_SELECTED_CURSOR
+                elif chosen:
+                    background = self.ROW_SELECTED
+                elif index == self._cursor:
+                    background = self.ROW_CURSOR
+                else:
+                    background = self.ROW_BG
+                self._list.itemconfig(index, background=background, foreground=TEXT)
+            if self._results:
+                self._list.see(self._cursor)
+        finally:
+            self._updating = False
+
+    def _set_message(self, text: str) -> None:
+        self._message.configure(text=text)
+
+    # ------------------------------------------------------------------- events
+    def _on_typing(self, _event: Any = None) -> None:
+        """Debounce the search: one query per pause, not one per keystroke."""
+        if self._search_job is not None:
+            try:
+                self.after_cancel(self._search_job)
+            except (tk.TclError, ValueError):
+                pass
+        self._search_job = self.after(120, self._reload)
+
+    def _reload(self) -> None:
+        """Fill the list for the current query, keeping the selection intact."""
+        self._search_job = None
+        try:
+            if not self.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        query = self._query.get().strip()
+        try:
+            if query:
+                self._results = list(self.catalog.search(query, 60))
+            else:
+                self._results = sorted(self.catalog.styles(),
+                                       key=lambda style: (str(style.get("family") or ""),
+                                                          str(style["name"]).lower()))
+        except JellyfinError as exc:
+            self._results = []
+            self._set_message(str(exc))
+        self._updating = True
+        try:
+            self._list.delete(0, "end")
+            for result in self._results:
+                name = str(result["name"])
+                if result.get("kind") == "family":
+                    name = f"{name}  (whole family)"
+                self._list.insert("end", f"  {name}   ({int(result.get('tracks') or 0):,})")
+        finally:
+            self._updating = False
+        self._cursor = max(0, min(self._cursor, len(self._results) - 1))
+        self._paint_rows()
+        self._show_details()
+        self._update_summary()
+
+    def _focus_row(self, which: int) -> None:
+        """↓/↑ inside the search field moves into the list (first/last row)."""
+        if not self._results:
+            return
+        self._cursor = 0 if which >= 0 else len(self._results) - 1
+        try:
+            self._list.focus_set()
+            self._list.activate(self._cursor)
+        except tk.TclError:
+            pass
+        self._paint_rows()
+        self._show_details()
+
+    def _move_cursor(self, step: int) -> None:
+        if not self._results:
+            return
+        self._cursor = max(0, min(self._cursor + step, len(self._results) - 1))
+        try:
+            self._list.activate(self._cursor)
+        except tk.TclError:
+            pass
+        self._paint_rows()
+        self._show_details()
+
+    def _on_click(self, event: Any) -> str:
+        """Toggle the clicked row; the list never selects anything by itself."""
+        index = self._list.nearest(event.y)
+        if 0 <= index < len(self._results):
+            self._toggle_row(index)
+        return "break"
+
+    def _toggle_cursor(self) -> None:
+        self._toggle_row(self._cursor)
+
+    def _toggle_row(self, index: int) -> None:
+        entry = self._entry_for_row(index)
+        if not entry:
+            return
+        self._cursor = index
+        if entry.startswith("family:"):
+            self._selected_families.symmetric_difference_update({entry.split(":", 1)[1]})
+            self._paint_chips()
+        else:
+            self._selected_styles.symmetric_difference_update({entry})
+        self._set_message("")
+        self._paint_rows()
+        self._show_details()
+        self._update_summary()
+
+    def _toggle_family(self, name: str) -> None:
+        self._selected_families.symmetric_difference_update({name})
+        self._set_message("")
+        self._paint_chips()
+        self._paint_rows()
+        self._update_summary()
+
+    def _set_mode(self, mode: str) -> None:
+        self._mode = mode if mode in ("any", "all", "not") else "any"
+        self._paint_modes()
+        self._update_summary()
+
+    # -------------------------------------------------------------- the selection
+    def _entry_for_row(self, index: int) -> str:
+        if not 0 <= index < len(self._results):
+            return ""
+        result = self._results[index]
+        if result.get("kind") == "family":
+            return f"family:{result['name']}"
+        return str(result["name"])
+
+    def _is_selected(self, entry: str) -> bool:
+        if not entry:
+            return False
+        if entry.startswith("family:"):
+            return entry.split(":", 1)[1] in self._selected_families
+        return entry in self._selected_styles
+
+    def _count(self) -> Optional[int]:
+        """How many tracks match, or ``None`` for "no filter at all"."""
+        entries = self.entries()
+        if not entries:
+            return None
+        ids, families = self.catalog.resolve(entries)
+        return int(self.catalog.count(ids, families, self._mode))
+
+    def _update_summary(self) -> None:
+        try:
+            count, error = self._count(), ""
+        except JellyfinError as exc:
+            count, error = 0, str(exc)
+        if error:
+            self._summary.configure(text="The style catalog could not be read", fg=DANGER)
+        elif count is None:
+            if self._library_total is None:
+                try:
+                    self._library_total = int(self.catalog.stats().get("playable") or 0)
+                except JellyfinError:
+                    self._library_total = 0
+            self._summary.configure(text=f"No filter · any of the {self._library_total:,} tracks",
+                                    fg=MUTED)
+        elif count:
+            self._summary.configure(text=f"{count:,} track{'s' if count != 1 else ''} match",
+                                    fg=TEXT)
+        else:
+            self._summary.configure(text="Nothing matches that combination", fg=DANGER)
+        enabled = count is None or bool(count)
+        self._play.configure(state="normal" if enabled else "disabled",
+                             bg=ACCENT if enabled else CARD_LIGHT,
+                             fg=TEXT if enabled else MUTED,
+                             activebackground=ACCENT_LIGHT, activeforeground=TEXT)
+
+    def _show_details(self) -> None:
+        if not self._results:
+            self._details.configure(text="No style matches that search.")
+            return
+        result = self._results[self._cursor]
+        parts = [str(result["name"])]
+        if result.get("family"):
+            parts.append(f"family {result['family']}")
+        parts.append(f"{int(result.get('tracks') or 0):,} tracks")
+        try:
+            aliases = self.catalog.aliases_for(str(result["name"]))
+        except Exception:                 # a damaged row must not break the panel
+            aliases = []
+        if aliases:
+            parts.append("also called " + ", ".join(aliases[:3]))
+        if self._is_selected(self._entry_for_row(self._cursor)):
+            parts.append("selected")
+        self._details.configure(text=" · ".join(parts))
+
+    # ------------------------------------------------------------------- actions
+    def _clear(self) -> None:
+        """Back to "any random song" (the selection is emptied)."""
+        self._selected_styles.clear()
+        self._selected_families.clear()
+        self._paint_chips()
+        self._paint_rows()
+        self._update_summary()
+        self._set_message("Filter cleared - Play goes back to any random song.")
+
+    def _close(self) -> None:
+        if self._on_close is not None:
+            self._on_close()
+
+    def _apply(self, from_keyboard: bool = False) -> None:
+        """Hand the selection over; an error from the caller keeps the panel open.
+
+        ``from_keyboard`` is the Enter key, where an empty selection means "play
+        the style under the cursor" (type "ska", Enter). The Play *button* always
+        applies exactly what is ticked, so an empty selection means no filter.
+        """
+        entries = self.entries()
+        if from_keyboard and not entries and self._results:
+            self._toggle_row(self._cursor)
+            entries = self.entries()
+        if entries:
+            try:
+                count = self._count()
+            except JellyfinError as exc:
+                self._set_message(str(exc))
+                return
+            if not count:
+                self._set_message("Nothing matches that combination - pick another style.")
+                return
+        self._set_message("")
+        if self._on_apply is None:
+            self._close()
+            return
+        error = self._on_apply(entries, self._mode)
+        if error:
+            self._set_message(str(error))
+            return
+        self._close()
 
 
 def format_time(seconds: Any) -> str:

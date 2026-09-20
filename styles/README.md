@@ -2,8 +2,7 @@
 
 This folder is **independent from the player**. It reads your music files and
 your Jellyfin server, decides what style each song is, and writes the result
-into one SQLite database. The player (phase 2) will only ever *read* that
-database.
+into one SQLite database. The player only ever *reads* that database.
 
 > **Nothing here ever writes to a music file, to Jellyfin, or to the player's
 > own configuration.** Every step is read-only towards the outside world and
@@ -196,14 +195,23 @@ python3 step3_vocabulary.py --all && python3 step4_normalize.py
 album (`"Artist :: Album"`) or per file path. An empty style list means "no
 style at all", so the track is never picked by a style filter.
 
-## What phase 2 will add to the player
+## How the player uses it
 
-`catalog.py` in the app (stdlib `sqlite3` only) will expose the same queries,
-and the UI will get a style picker: type or select a style (fuzzy search over
-names *and* aliases, with track counts), `G` to open it, chips showing the
-active filter, and a filtered queue that starts playing in ~3 ms. The player
-keeps its "standard library + Pillow" promise: no TensorFlow, no LLM, no
-network - only the database.
+`catalog.py` in the app (stdlib `sqlite3` only) exposes the same queries and
+opens this file read-only: **no style or tag is ever written back**. In the
+player, `G` opens the style panel (fuzzy search over names and aliases with
+track counts, family chips, `any of` / `all of` / `not`), `Play these` applies
+the selection, and the choice is remembered in the player's config. The queue
+then refills from the catalog in a few milliseconds instead of asking Jellyfin
+for random songs.
+
+```bash
+python3 main.py --style "Ska Punk"                # from the command line
+python3 main.py --style "family:Metal" --style-mode any
+```
+
+The player keeps its "standard library + Pillow" promise: no TensorFlow, no
+LLM, no extra network - only the database file.
 
 ## Troubleshooting
 

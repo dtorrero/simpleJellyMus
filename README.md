@@ -42,6 +42,37 @@ python3 main.py --windowed       # start windowed (this is the default)
 python3 main.py --login          # force the login screen
 python3 main.py --reset-login    # forget the saved login and exit
 python3 main.py --debug          # verbose Jellyfin + mpv logging
+python3 main.py --style "Ska Punk"                     # only that style
+python3 main.py --style "Black Metal" --style "Ska Punk"  # either of the two
+python3 main.py --style "family:Metal"                 # a whole family
+python3 main.py --style "Ska Punk" --style-mode all    # both at once
+python3 main.py --style "Schlager" --style-mode not    # everything but that
+```
+
+### Play by style
+
+Random by style instead of random everything, picked from a **local catalog**
+(`~/.local/share/simplejellymus/catalog.sqlite`, built once with
+`styles/prepare_styles.sh` — see `styles/README.md`). Style names are matched
+fuzzily, aliases and small typos included, and the catalog is opened
+**read-only**: the player never writes to the dataset or to your music.
+
+| `--style` accepts | Example |
+|---|---|
+| a style name | `--style "Ska Punk"` |
+| an alias | `--style "outrun"` → Synthwave |
+| a family | `--style "family:Metal"` (a style with the same name wins: `--style Metal` is the style, `family:Metal` the family) |
+
+`--style-mode` decides what several styles mean together: `any` (default, plays
+whatever matches at least one), `all` (must carry every style) or `not` (plays
+everything *except* the selection). Lookups are single-digit milliseconds
+against the local file, so a filtered queue refills instantly; without
+`--style` (and without a catalog) the player behaves exactly as before. An
+unknown name is refused with a suggestion instead of playing the wrong thing:
+
+```bash
+$ python3 main.py --style "trash metl"
+Cannot filter by style: Unknown style 'trash metl' - did you mean 'Thrash Metal'?
 ```
 
 The app starts **windowed** (remembering the size and fullscreen/windowed mode
@@ -96,11 +127,38 @@ saved). On the next start the player goes straight to the music.
 | `S` | restart the current track |
 | `↑` / `↓` | volume up / down (mouse wheel works too) |
 | `,` / `.` | seek -10 s / +10 s |
-| `Esc` or `F` | switch between windowed and fullscreen |
+| `G` | play by style (open the style panel) |
+| `?` | keyboard help (also the **?** button in the top right) |
+| `Esc` | close an open panel, otherwise switch windowed ⇄ fullscreen |
+| `F` | switch windowed ⇄ fullscreen |
 | `Q` (or `Ctrl+Q`) | quit |
 
 The on-screen buttons do the same: click the cover art area's transport
-buttons, or click the progress bar to seek.
+buttons, or click the progress bar to seek; **Change account** and **Quit** sit
+in the top right next to **?**.
+
+### Play by style in the player
+
+`G` opens a panel that lists the styles of the local catalog: search them by
+typing (typos are tolerated), tick as many as you like, add a whole family with
+one of the family chips, and choose whether the selection means *any of them*,
+*all of them* or *everything but them*. The line at the bottom always shows how
+many tracks the current combination would play, and `Play these` applies it.
+
+| In the panel | Action |
+|---|---|
+| type | filter the list (search asks the local catalog, never the server) |
+| `↓` / `↑` (in the search box) | move into the list |
+| click / `Space` | tick or untick the highlighted style (clicking again untickes) |
+| `Enter` | play what is ticked — or, with nothing ticked, the style you typed |
+| `Clear` | empty the selection: `Play these` then means *any random song* again |
+| `Cancel` / `Esc` | close without changing anything |
+
+The song that is playing is never interrupted: a new selection applies from the
+next track on. If the track already preloaded next does not match, it is
+replaced while the current one keeps playing (it usually has minutes left).
+The selection is remembered in the config file, so it is still there after a
+restart.
 
 ## How it works
 
@@ -147,8 +205,9 @@ Tkinter UI (ui.py) ──state snapshots── PlayerEngine (player.py)
 | `main.py` | entry point, CLI flags, login/player screen switching, window focusing |
 | `instance.py` | single-instance guard (Unix socket in `$XDG_RUNTIME_DIR`) |
 | `jellyfin.py` | Jellyfin client (login, random batches, stream/image URLs, downloads) + config storage |
+| `catalog.py` | read-only access to the local style catalog (styles, families, search, filtered random batches) |
 | `player.py` | mpv IPC client, preloader cache, random play queue, engine |
-| `ui.py` | Tkinter login screen and fullscreen player UI |
+| `ui.py` | Tkinter login screen and fullscreen player UI (plus the `?` help and the style panel) |
 | `selftest.py` | offline self-test: fake Jellyfin server + generated audio (see below) |
 | `install.sh` | installs/removes the menu entry and the icon (see below) |
 | `simplejellymus.desktop` | launcher template (`@APPDIR@` is filled in by `install.sh`) |
@@ -159,7 +218,8 @@ Tkinter UI (ui.py) ──state snapshots── PlayerEngine (player.py)
 `selftest.py` starts a small fake Jellyfin server (with decoy video items),
 generates short WAV tracks, and verifies the whole pipeline: login, the
 music-only filter, cover download, the preload cache, gapless auto-advance,
-next/previous, pause, volume, seeking, the UI layout (long titles), and the
+next/previous, pause, volume, seeking, the UI layout (long titles), the
+style catalog (search, families, `any`/`all`/`not`, filtered queues) and the
 single-instance guard.
 
 ```bash
@@ -175,7 +235,7 @@ are never touched. Set `SELFTEST_DEBUG=1` for verbose mpv logging.
 
 | Path | Content |
 |---|---|
-| `~/.config/simplejellymus/config.json` | server URL, username, access token, user id, device id, volume, window mode and size |
+| `~/.config/simplejellymus/config.json` | server URL, username, access token, user id, device id, volume, window mode and size, and the style filter picked with `G` |
 | `~/.cache/simplejellymus/audio/` | preloaded (next) tracks, pruned automatically |
 | `~/.cache/simplejellymus/covers/` | album art cache |
 | `$XDG_RUNTIME_DIR/simplejellymus.sock` | single-instance guard (removed when the app quits) |

@@ -25,7 +25,7 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
-from typing import Any, Callable, Deque, Dict, List, Optional
+from typing import Any, Callable, Deque, Dict, List, Optional, Sequence
 
 from jellyfin import (
     AUDIO_CACHE_DIR,
@@ -496,8 +496,12 @@ class PlayQueue:
 
     def __init__(self, client: JellyfinClient, *, history_limit: int = HISTORY_LIMIT,
                  batch_size: int = QUEUE_BATCH_SIZE, min_batch: int = QUEUE_MIN_BATCH,
+                 source: Optional[Callable[[int], List[Dict[str, Any]]]] = None,
                  debug: bool = False) -> None:
         self._client = client
+        # Where batches come from. Without a style filter this *is*
+        # ``client.random_batch`` - the behaviour of the player is unchanged.
+        self._source = source or client.random_batch
         self._debug = debug
         self._batch: List[Dict[str, Any]] = []
         self._batch_ids: set = set()
@@ -510,6 +514,18 @@ class PlayQueue:
         self.last_error: Optional[str] = None
 
     # ------------------------------------------------------------------ public
+    def set_source(self, source: Optional[Callable[[int], List[Dict[str, Any]]]]) -> None:
+        """Replace where the next batches come from (style filter on/off).
+
+        The current batch is dropped so the next refill uses the new source;
+        tracks already handed to the player keep playing.
+        """
+        with self._lock:
+            self._source = source or self._client.random_batch
+            self._batch = []
+            self._batch_ids = set()
+            self.last_error = None
+
     def ensure_batch(self, *, timeout: float = LIBRARY_TIMEOUT_SECONDS) -> bool:
         """Block (up to *timeout*) until at least one track is available."""
         deadline = time.time() + max(0.0, timeout)
@@ -564,7 +580,7 @@ class PlayQueue:
     # --------------------------------------------------------------- internals
     def _refill(self) -> None:
         try:
-            items = self._client.random_batch(self._batch_size)
+            items = self._source(self._batch_size)
             self.last_error = None
         except JellyfinError as exc:
             items = []
@@ -590,9 +606,13 @@ class PlayQueue:
 class PlayerEngine:
     """Coordinates the mpv process, the preload cache and the random queue."""
 
-    def __init__(self, client: JellyfinClient, *, volume: int = 80, debug: bool = False) -> None:
+    def __init__(self, client: JellyfinClient, *, volume: int = 80, debug: bool = False,
+                 catalog: Optional[Any] = None, style_filter: Optional[Sequence[str]] = None,
+                 style_mode: str = "any") -> None:
         self.client = client
         self.debug = debug
+        # The style catalog is optional: without it the player is what it always was.
+        self.catalog = catalog
         self.queue = PlayQueue(client, debug=debug)
         self.preloader = Preloader(client, debug=debug)
         self.mpv = MpvPlayer(volume=volume, debug=debug)
@@ -618,6 +638,14 @@ class PlayerEngine:
         self._deadline: Optional[threading.Timer] = None
         self._preload_token = 0
         self._stopped = threading.Event()
+        # The style filter. Empty means "any random song", i.e. what the player
+        # has always done; it is only consulted when it holds something.
+        self._filter: Dict[str, Any] = {"entries": [], "ids": [], "families": [], "mode": "any"}
+        if style_filter:
+            try:
+                self.set_style_filter(style_filter, style_mode)
+            except JellyfinError as exc:
+                print(f"[engine] ignoring the style filter: {exc}", flush=True)
 
     # --------------------------------------------------------------- public API
     @property
@@ -643,7 +671,95 @@ class PlayerEngine:
                 "preload_ready": self._appended,
                 "server": self.client.server_url,
                 "user": self.client.username,
+                "filter": {"entries": list(self._filter["entries"]),
+                           "mode": self._filter["mode"]},
             }
+
+    # -------------------------------------------------------------- style filter
+    def set_style_filter(self, entries: Optional[Sequence[str]] = None,
+                         mode: str = "any") -> None:
+        """Restrict random picking to a selection of styles (empty = unrestricted).
+
+        The song that is playing is never interrupted: the filter applies from the
+        next track on. If the already preloaded next track does not match, it is
+        dropped and replaced immediately - the current song usually has minutes
+        left, so the preloader has plenty of time to fetch a matching one and
+        playback stays gapless.
+
+        ``entries`` are style names, aliases or ``family:Name``; an unknown name
+        raises :class:`JellyfinError` and leaves the filter untouched.
+        """
+        names = [str(entry).strip() for entry in (entries or []) if str(entry).strip()]
+        mode = mode if mode in ("any", "all", "not") else "any"
+        ids: List[str] = []
+        families: List[str] = []
+        if names and self.catalog is not None:
+            ids, families = self.catalog.resolve(names)
+            # An empty selection would silently leave the player without music,
+            # so it is refused before anything is changed.
+            if not self.catalog.count(ids, families, mode):
+                raise JellyfinError(f"{' + '.join(names)} ({mode}) matches no tracks")
+        with self._lock:
+            self._filter = {"entries": names, "ids": ids, "families": families, "mode": mode}
+        self.queue.set_source(self._batch_source())
+        if self.debug:
+            print(f"[engine] style filter: {', '.join(names) if names else 'everything'}"
+                  f" ({mode})", flush=True)
+        if names and self.catalog is None:
+            self._set_error("No style catalog yet - playing any random song")
+        # Re-check the track that is already waiting to play next.
+        with self._lock:
+            pending = dict(self._pending_next) if self._pending_next else None
+            appended = self._appended
+        if pending is not None and not self._matches_filter(pending):
+            self.preloader.cancel()
+            with self._lock:
+                self._pending_next = None
+                self._pending_entry = None
+                self._appended = False
+            if appended:
+                try:
+                    self.mpv.clear_playlist()
+                except PlayerError:
+                    pass
+            if self.debug:
+                print("[engine] the preloaded track is outside the new filter - "
+                      "picking another one", flush=True)
+            self._schedule_preload()
+        self._emit()
+
+    def _batch_source(self) -> Callable[[int], List[Dict[str, Any]]]:
+        """The callable the queue refills from (Jellyfin or the catalog)."""
+        with self._lock:
+            ids = list(self._filter.get("ids") or [])
+            families = list(self._filter.get("families") or [])
+            mode = str(self._filter.get("mode") or "any")
+        catalog = self.catalog
+        if not ids and not families:
+            return self.client.random_batch          # exactly the classic behaviour
+        if catalog is None:
+            return self.client.random_batch
+
+        def from_catalog(limit: int) -> List[Dict[str, Any]]:
+            return catalog.random_batch(ids, families, mode, limit)
+
+        return from_catalog
+
+    def _matches_filter(self, item: Optional[Dict[str, Any]]) -> bool:
+        """Is *item* inside the current selection? (no filter: always true)"""
+        with self._lock:
+            has_filter = bool(self._filter.get("entries"))
+            ids = list(self._filter.get("ids") or [])
+            families = list(self._filter.get("families") or [])
+            mode = str(self._filter.get("mode") or "any")
+        if not has_filter or self.catalog is None:
+            return True
+        try:
+            return self.catalog.matches(item or {}, ids, families, mode)
+        except JellyfinError as exc:
+            if self.debug:
+                print(f"[engine] style lookup failed: {exc}", flush=True)
+            return True       # a lookup must never stop the music
 
     def _emit(self) -> None:
         state = self.snapshot()
@@ -848,6 +964,9 @@ class PlayerEngine:
                 self._pending_entry = None
             self._emit()
             self._schedule_preload()
+            if self.debug and item.get("_styles"):
+                print(f"[engine] playing {JellyfinClient.display_title(item)}"
+                      f" [{', '.join(item['_styles'])}]", flush=True)
 
     def _schedule_preload(self, attempt: int = 0) -> None:
         """Download the follow-up track and append it to mpv's playlist."""
@@ -856,13 +975,13 @@ class PlayerEngine:
         with self._lock:
             if self._pending_next is None:
                 if 0 <= self._pos + 1 < len(self._seq):
-                    self._pending_next = self._seq[self._pos + 1]
-                    self._pending_sequential = True
-                else:
+                    candidate = dict(self._seq[self._pos + 1])
+                    if self._matches_filter(candidate):
+                        self._pending_next = candidate
+                        self._pending_sequential = True
+                if self._pending_next is None:
                     candidate = self._pick_item()
-                    if candidate is None:
-                        self._pending_next = None
-                    else:
+                    if candidate is not None:
                         self._pending_next = candidate
                         self._pending_sequential = False
                         self._emit()
@@ -949,8 +1068,15 @@ class PlayerEngine:
     def _advance_target(self):
         """Return ``(item, is_sequential)`` for the song that should play next."""
         with self._lock:
-            if 0 <= self._pos + 1 < len(self._seq):
-                return dict(self._seq[self._pos + 1]), True
+            item = dict(self._seq[self._pos + 1]) if 0 <= self._pos + 1 < len(self._seq) else None
+        if item is not None:
+            if self._matches_filter(item):
+                return item, True
+            # The song that followed this one in the history is outside the new
+            # filter: pick a matching one instead. The filter wins over the old
+            # walking order - Previous still goes back where you came from.
+            if self.debug:
+                print("[engine] skipping a queued track outside the style filter", flush=True)
         return self._pick_item(), False
 
     def _pick_item(self) -> Optional[Dict[str, Any]]:

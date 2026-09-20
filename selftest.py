@@ -32,8 +32,8 @@ os.environ["XDG_CACHE_HOME"] = str(_TMP / "cache")
 os.environ["XDG_CONFIG_HOME"] = str(_TMP / "config")
 
 import jellyfin  # noqa: E402  (imported once the environment is ready)
-from jellyfin import AuthError, JellyfinClient  # noqa: E402
-from player import PlayerEngine, Preloader  # noqa: E402
+from jellyfin import AuthError, JellyfinClient, JellyfinError  # noqa: E402
+from player import PlayerEngine, PlayQueue, Preloader  # noqa: E402
 
 TOKEN = "test-token"
 # Tracks are deliberately short: the whole playback flow (including the
@@ -347,11 +347,19 @@ def test_engine(report: Reporter, client: JellyfinClient):
                      f"{second_id} -> {third['Id'] if third else 'nothing'}")
 
         if third is not None:
+            # What "back" means is read from the engine's own history right before
+            # the call: on 4-second test tracks the player can auto-advance
+            # between two assertions, and that must not look like a bug here.
+            expected_back = None
+            with engine._lock:
+                if engine._pos > 0:
+                    expected_back = engine._seq[engine._pos - 1].get("Id")
             engine.previous_track()
             back = track_changed(engine, third["Id"], 15)
             report.check("previous goes back to the track we came from",
-                         back is not None and back["Id"] == second_id,
-                         f"{third['Id']} -> {back['Id'] if back else 'nothing'}")
+                         back is not None and back["Id"] == expected_back,
+                         f"{third['Id']} -> {back['Id'] if back else 'nothing'}"
+                         f" (expected {expected_back}, started from {second_id})")
             if back is not None and engine._pos > 0:
                 # Regression guard: "previous" steps to the entry before the
                 # current one in the history instead of appending the track and
@@ -404,6 +412,56 @@ def test_engine(report: Reporter, client: JellyfinClient):
     report.check("mpv is shut down with the engine",
                  process is not None and process.poll() is not None)
     return engine
+
+
+def _noop(*_args: Any, **_kwargs: Any) -> None:
+    """A do-nothing callback for the UI tests."""
+
+
+class _StubEngine:
+    """A player engine good enough to build the real PlayerScreen against."""
+
+    volume = 40
+
+    def __init__(self, item: Any = None) -> None:
+        self.style_calls: list = []
+        self.filter = {"entries": [], "mode": "any"}
+        item = item or {"Id": "x1", "Name": "Stub", "Artists": ["A"], "Album": "B"}
+        self._state = {
+            "current": item, "up_next": None, "position": 1.0, "duration": 10.0,
+            "paused": False, "volume": 40, "status": "Playing " + item.get("Name", ""),
+            "error": "", "preload_ready": False, "server": "http://stub", "user": "stub",
+        }
+
+    def add_listener(self, callback: Any) -> None:
+        self._listener = callback
+
+    def snapshot(self) -> dict:
+        state = dict(self._state)
+        state["filter"] = {"entries": list(self.filter["entries"]),
+                           "mode": self.filter["mode"]}
+        return state
+
+    def set_style_filter(self, entries: Any = None, mode: str = "any") -> None:
+        self.style_calls.append((list(entries or []), mode))
+        self.filter = {"entries": list(entries or []), "mode": mode}
+
+    adjust_volume = seek_relative = seek_absolute = _noop
+    toggle_pause = next_track = previous_track = restart_track = _noop
+
+
+def widget_texts(widget: Any) -> list:
+    """Every text shown inside a widget tree (used by the overlay checks)."""
+    texts = []
+    for child in widget.winfo_children():
+        try:
+            text = child.cget("text")
+        except Exception:
+            text = ""
+        if text:
+            texts.append(str(text))
+        texts.extend(widget_texts(child))
+    return texts
 
 
 def test_ui(report: Reporter) -> None:
@@ -596,6 +654,404 @@ def test_ui(report: Reporter) -> None:
         root.destroy()
 
 
+def test_overlays(report: Reporter) -> None:
+    """The "?" card and the overlay mechanics it shares with the style picker.
+
+    An overlay is *placed* over the screen, never packed - that is what lets the
+    help and the picker exist without moving the artwork, the progress bar, the
+    transport or the footer by a single pixel.
+    """
+    try:
+        import tkinter as tk
+
+        import ui
+    except ImportError as exc:
+        report.check(f"tkinter is importable ({exc})", False)
+        return
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        print(f"  [skip] no display for the overlay check ({exc})", flush=True)
+        return
+
+    def pump(seconds: float) -> None:
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            root.update()
+            time.sleep(0.02)
+
+    screen = None
+    try:
+        root.geometry("1280x800")
+        screen = ui.PlayerScreen(root, engine=_StubEngine(),
+                                 client=JellyfinClient("http://127.0.0.1:1"),
+                                 family=ui.pick_font_family(),
+                                 on_change_account=_noop, on_quit=_noop)
+        screen.pack(fill="both", expand=True)
+        pump(0.6)
+
+        # ------------------------------------------------------------ the button
+        buttons = [child for child in screen._header.winfo_children()
+                   if isinstance(child, tk.Button)]
+        labels = [str(button.cget("text")) for button in buttons]
+        report.check("the header has the \"?\" button", "?" in labels, str(labels))
+        heights = {button.winfo_reqheight() for button in buttons}
+        report.check("the new button is exactly as tall as its neighbours",
+                     len(heights) == 1, str(heights))
+        report.check("the header height is unchanged by the extra button",
+                     screen._header.winfo_reqheight() == max(heights),
+                     f"header {screen._header.winfo_reqheight()}px, buttons {max(heights)}px")
+
+        # ----------------------------------------------------------- the bindings
+        # Moving the keys into one table must not lose a single binding.
+        legacy = ("<space>", "<Right>", "<n>", "<N>", "<Left>", "<p>", "<P>", "<Up>", "<Down>",
+                  "<Button-4>", "<Button-5>", "<s>", "<S>", "<comma>", "<period>", "<f>", "<F>",
+                  "<Escape>", "<Control-q>", "<q>", "<Q>")
+        missing = [sequence for sequence in legacy if not root.bind(sequence)]
+        report.check("every key the player had before is still bound", not missing, str(missing))
+        table = ui.PlayerScreen._SHORTCUTS
+        report.check("every shortcut row points at a real method",
+                     all(getattr(screen, name, None) is not None for name, _s, _t in table))
+        report.check("every key of the table is really bound",
+                     all(root.bind(sequence) for _n, sequences, _t in table
+                         for sequence in sequences))
+        report.check("the ? key is in the table and opens the help",
+                     any(name == "_open_help" and "<question>" in sequences
+                         for name, sequences, _t in table))
+
+        # ------------------------------------------------------------- the card
+        def metrics() -> tuple:
+            return (screen._cover_size, screen._progress.winfo_rooty(),
+                    screen._transport.winfo_rooty(), screen._footer.winfo_rooty(),
+                    screen._text_block_height, screen._header.winfo_height())
+
+        before = metrics()
+        screen._open_help()
+        pump(0.2)
+        card = screen._overlay
+        report.check("? opens the help card", card is not None)
+        if card is None:
+            return
+        report.check("the card is placed, not packed", bool(card.place_info()))
+        width, height = card.winfo_width(), card.winfo_height()
+        report.check("the card fits inside the window",
+                     0 <= card.winfo_x() and 0 <= card.winfo_y()
+                     and card.winfo_x() + width <= screen.winfo_width()
+                     and card.winfo_y() + height <= screen.winfo_height(),
+                     f"{width}x{height} at {card.winfo_x()},{card.winfo_y()}")
+        report.check("opening the card moves nothing in the layout",
+                     metrics() == before, f"{before} -> {metrics()}")
+        shown = widget_texts(card)
+        rows = screen._help_rows()
+        report.check("the help shows every shortcut of the table",
+                     all(keys in shown for keys, _text in rows),
+                     str([keys for keys, _t in rows if keys not in shown]))
+        report.check("the help mentions ? itself and Esc", "?" in shown and "Esc" in shown)
+
+        # -------------------------------------------------------------- Esc owns it
+        # The spy *replaces* the real toggle: whether the window manager honours
+        # fullscreen is not something a test should depend on - only that Esc was
+        # routed to the right action.
+        calls = {"fullscreen": 0}
+        real_toggle = screen._toggle_fullscreen
+
+        def counting_toggle() -> None:
+            calls["fullscreen"] += 1
+
+        screen._toggle_fullscreen = counting_toggle
+        report.check("Esc is consumed by the open card", screen._on_escape() == "break")
+        pump(0.2)
+        report.check("Esc closed the card", screen._overlay is None)
+        report.check("Esc did not also switch fullscreen", calls["fullscreen"] == 0)
+        screen._on_escape()                    # nothing open: the old behaviour
+        report.check("Esc still switches fullscreen when nothing is open",
+                     calls["fullscreen"] == 1)
+        screen._toggle_fullscreen = real_toggle
+        report.check("the window never moved during the Esc checks", metrics() == before,
+                     f"{before} -> {metrics()}")
+
+        # A card owns the keyboard: the global shortcuts must not fire as well.
+        class FakeEvent:
+            def __init__(self, widget: Any) -> None:
+                self.widget = widget
+
+        seen = {"n": 0}
+        wrapped = screen._wrap(lambda: seen.__setitem__("n", seen["n"] + 1))
+        screen._open_help()
+        pump(0.2)
+        wrapped(FakeEvent(screen))
+        report.check("an open card swallows the global shortcuts", seen["n"] == 0)
+        screen._close_overlay()
+        pump(0.2)
+        wrapped(FakeEvent(screen))
+        report.check("closing the card gives the shortcuts back", seen["n"] == 1)
+        entry = tk.Entry(screen)
+        seen["n"] = 0
+        wrapped(FakeEvent(entry))
+        report.check("a focused text field still swallows the shortcuts", seen["n"] == 0)
+        entry.destroy()
+
+        # ------------------------------------------------------- cards do not pile up
+        children = len(screen.winfo_children())
+        for _ in range(3):
+            screen._open_help()
+            pump(0.15)
+            screen._close_overlay()
+            pump(0.15)
+        report.check("cards do not pile up",
+                     len(screen.winfo_children()) == children,
+                     f"{len(screen.winfo_children())} children vs {children}")
+        report.check("the layout is untouched after opening and closing cards",
+                     metrics() == before, f"{before} -> {metrics()}")
+    finally:
+        if screen is not None:
+            screen.destroy()
+        root.destroy()
+
+
+def test_style_panel(report: Reporter) -> None:
+    """The "play by style" panel: search, families, modes, apply and cancel."""
+    try:
+        import tkinter as tk
+
+        import ui
+    except ImportError as exc:
+        report.check(f"tkinter is importable ({exc})", False)
+        return
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        print(f"  [skip] no display for the style panel check ({exc})", flush=True)
+        return
+
+    def pump(seconds: float) -> None:
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            root.update()
+            time.sleep(0.02)
+
+    def picker_in(widget):
+        for child in widget.winfo_children():
+            if isinstance(child, ui.StylePicker):
+                return child
+            found = picker_in(child)
+            if found is not None:
+                return found
+        return None
+
+    def row_for(picker, name: str) -> int:
+        for index in range(picker._list.size()):
+            if picker._list.get(index).strip().startswith(name + " "):
+                return index
+        return -1
+
+    screen = None
+    try:
+        catalog = build_fake_catalog(_TMP / "panel-catalog.sqlite")
+        catalog_module = __import__("catalog")
+        cat = catalog_module.Catalog(catalog)
+        root.geometry("1280x800")
+        engine = _StubEngine()
+        saved = []
+        screen = ui.PlayerScreen(root, engine=engine, client=JellyfinClient("http://127.0.0.1:1"),
+                                 family=ui.pick_font_family(), on_change_account=_noop,
+                                 on_quit=_noop, catalog=cat,
+                                 on_style_change=lambda entries, mode: saved.append((entries, mode)))
+        screen.pack(fill="both", expand=True)
+        pump(1.0)                     # let the debounced first layout settle
+
+        def metrics() -> tuple:
+            return (screen._cover_size, screen._progress.winfo_rooty(),
+                    screen._transport.winfo_rooty(), screen._footer.winfo_rooty(),
+                    screen._text_block_height)
+
+        before = metrics()
+        report.check("G is in the table and opens the panel",
+                     any(name == "_open_style_picker" and "<g>" in sequences
+                         for name, sequences, _t in ui.PlayerScreen._SHORTCUTS))
+        screen._open_style_picker()
+        pump(0.3)
+        picker = picker_in(screen._overlay) if screen._overlay is not None else None
+        report.check("G opens the style panel", picker is not None)
+        if picker is None:
+            return
+        report.check("the panel lists every style", picker._list.size() == 3,
+                     f"{picker._list.size()} rows")
+        report.check("the families are offered as chips", len(picker._chip_buttons) == 2,
+                     str(sorted(picker._chip_buttons)))
+        report.check("the panel moves nothing in the layout", metrics() == before,
+                     f"{before} -> {metrics()}")
+        report.check("with nothing selected it says there is no filter",
+                     "No filter" in picker._summary.cget("text"),
+                     picker._summary.cget("text"))
+        report.check("the Play button is available without a filter",
+                     str(picker._play.cget("state")) == "normal")
+
+        # ------------------------------------------------------------- searching
+        picker._query.set("alph")
+        picker._reload()
+        pump(0.1)
+        report.check("typing narrows the list",
+                     picker._list.size() == 1
+                     and picker._list.get(0).strip().startswith("Alpha"),
+                     f"{picker._list.size()} rows: "
+                     f"{[picker._list.get(i) for i in range(picker._list.size())]}")
+        report.check("the detail line describes the highlighted style",
+                     "Alpha" in picker._details.cget("text")
+                     and "3 tracks" in picker._details.cget("text"),
+                     picker._details.cget("text"))
+
+        # ----------------------------------------------------------- selecting
+        picker._toggle_row(row_for(picker, "Alpha"))
+        pump(0.1)
+        report.check("clicking a style selects it", picker.entries() == ["Alpha"],
+                     str(picker.entries()))
+        report.check("the count line follows the selection",
+                     "3 track" in picker._summary.cget("text"), picker._summary.cget("text"))
+        report.check("the selected row is highlighted",
+                     picker._list.itemcget(0, "background") == picker.ROW_SELECTED_CURSOR,
+                     picker._list.itemcget(0, "background"))
+
+        picker._toggle_family("Alpha Family")
+        pump(0.1)
+        report.check("a family chip adds the whole family",
+                     picker.entries() == ["family:Alpha Family", "Alpha"],
+                     str(picker.entries()))
+        report.check("the chip shows as selected",
+                     picker._chip_buttons["Alpha Family"].cget("bg") == ui.ACCENT)
+
+        # ------------------------------------------------------------- the modes
+        picker._set_mode("all")
+        pump(0.1)
+        report.check("'all of' needs every style of the selection",
+                     "1 track" in picker._summary.cget("text"),
+                     picker._summary.cget("text"))
+        picker._set_mode("not")
+        pump(0.1)
+        report.check("'not' counts the rest of the library",
+                     "3 track" in picker._summary.cget("text"), picker._summary.cget("text"))
+        picker._set_mode("any")
+        pump(0.1)
+        report.check("the active mode is the highlighted button",
+                     picker._mode_buttons["any"].cget("bg") == ui.ACCENT
+                     and picker._mode_buttons["not"].cget("bg") == ui.CARD_LIGHT)
+
+        # ---------------------------------------------------------- applying it
+        # Deterministic state (not dependent on what the checks above selected):
+        # every track has Alpha or Beta, so "not (both families)" matches nothing.
+        picker._clear()
+        picker._toggle_family("Alpha Family")
+        picker._toggle_family("Beta Family")
+        picker._set_mode("not")
+        pump(0.1)
+        report.check("a combination that matches nothing is shown as such",
+                     "Nothing matches" in picker._summary.cget("text")
+                     and str(picker._play.cget("state")) == "disabled",
+                     f"{picker._summary.cget('text')} / {picker._play.cget('state')}")
+        picker._apply()
+        pump(0.1)
+        report.check("such a combination is refused, with the panel still open",
+                     screen._overlay is not None
+                     and "Nothing matches" in picker._message.cget("text"),
+                     picker._message.cget("text"))
+        report.check("and the engine was never asked", not engine.style_calls)
+
+        picker._set_mode("any")
+        picker._clear()
+        pump(0.1)
+        report.check("Clear empties the selection", picker.entries() == [], str(picker.entries()))
+        report.check("Clear goes back to any random song",
+                     "No filter" in picker._summary.cget("text")
+                     and "any random song" in picker._message.cget("text"),
+                     picker._summary.cget("text"))
+        picker._apply()
+        pump(0.2)
+        report.check("applying an empty filter asks for the whole library",
+                     engine.style_calls[-1] == ([], "any"), str(engine.style_calls[-1]))
+        report.check("the panel closes when the choice is applied",
+                     screen._overlay is None)
+        report.check("the app was told to remember the choice",
+                     saved and saved[-1] == ([], "any"), str(saved))
+        report.check("the layout is untouched after a full round trip",
+                     metrics() == before, f"{before} -> {metrics()}")
+
+        # ------------------------------------------- the Enter key (type and go)
+        screen._open_style_picker()
+        pump(0.3)
+        picker = picker_in(screen._overlay) if screen._overlay is not None else None
+        engine.style_calls.clear()
+        if picker is not None:
+            picker._query.set("beta")
+            picker._reload()
+            pump(0.1)
+            picker._apply(True)             # as the Return key does
+            pump(0.2)
+            report.check("Enter plays the style that was typed",
+                         engine.style_calls[-1] == (["Beta"], "any"), str(engine.style_calls))
+            report.check("the panel closes after Enter", screen._overlay is None)
+
+        # ------------------------------------------------------ reopening it
+        engine.filter = {"entries": ["Beta"], "mode": "any"}
+        screen._open_style_picker()
+        pump(0.3)
+        picker = picker_in(screen._overlay) if screen._overlay is not None else None
+        report.check("reopening shows the filter that is playing",
+                     picker is not None and picker.entries() == ["Beta"]
+                     and picker._mode == "any", str(picker.entries() if picker else None))
+        if picker is not None:
+            row = row_for(picker, "Beta")
+            report.check("its row is marked as selected",
+                         row in picker._list.curselection(), str(picker._list.curselection()))
+            engine.style_calls.clear()
+            picker._close()
+            pump(0.2)
+            report.check("Cancel leaves the filter alone",
+                         screen._overlay is None and not engine.style_calls)
+        report.check("the layout survived the panel", metrics() == before,
+                     f"{before} -> {metrics()}")
+
+        # --------------------------------------------------- without a catalog
+        screen.catalog = None
+        screen._open_style_picker()
+        pump(0.2)
+        texts = widget_texts(screen._overlay)
+        report.check("without a catalog the panel explains what to do",
+                     picker_in(screen._overlay) is None
+                     and any("prepare_styles.sh" in text for text in texts),
+                     str([text for text in texts if "prepare" in text]))
+    finally:
+        if screen is not None:
+            screen.destroy()
+        root.destroy()
+
+
+def test_style_config(report: Reporter) -> None:
+    """The style filter is remembered across restarts (config round trip)."""
+    import main
+
+    report.check("a saved filter is read back",
+                 main.saved_style_filter({"style_filter": {"entries": ["Beta"], "mode": "not"}})
+                 == (["Beta"], "not"))
+    report.check("a missing or damaged filter falls back to no filter",
+                 main.saved_style_filter({}) == ([], "any")
+                 and main.saved_style_filter({"style_filter": "nonsense"}) == ([], "any")
+                 and main.saved_style_filter({"style_filter": {"entries": [], "mode": "junk"}})
+                 == ([], "any"))
+    app = type("FakeApp", (), {})()
+    app.config = dict(jellyfin.load_config() or {})
+    app.style_filter, app.style_mode = [], "any"
+    main.Application._save_style_filter(app, ["family:Metal", "Ska Punk"], "all")
+    stored = jellyfin.load_config() or {}
+    report.check("the player's choice is written to the config file",
+                 stored.get("style_filter") == {"entries": ["family:Metal", "Ska Punk"],
+                                                "mode": "all"},
+                 str(stored.get("style_filter")))
+    report.check("and comes back as the same filter",
+                 main.saved_style_filter(stored) == (["family:Metal", "Ska Punk"], "all"))
+    report.check("the window settings are not lost by saving the filter",
+                 stored.get("window_mode") in (None, "windowed", "fullscreen"))
+
+
 def test_launcher(report: Reporter) -> None:
     """The icon, the installer and the launcher must agree on one file and name.
 
@@ -702,6 +1158,163 @@ def test_instance(report: Reporter) -> None:
     takeover.close()
 
 
+def build_fake_catalog(path: Path) -> Path:
+    """A tiny catalog in the shape the player reads.
+
+    a1/a3/a5 -> Alpha (+ a5 also Gamma), a2/a4/a6 -> Beta, so three cases are
+    covered at once: a plain style, a family (Alpha + Gamma) and "all of".
+    """
+    import sqlite3
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(str(path))
+    try:
+        connection.executescript(
+            "CREATE TABLE tracks (id TEXT PRIMARY KEY, rel_path TEXT UNIQUE, name TEXT,"
+            " album TEXT, album_id TEXT, album_artist TEXT, artists TEXT, year INTEGER,"
+            " duration_ms INTEGER, container TEXT, image_tag TEXT, album_image_tag TEXT,"
+            " raw_genre TEXT, primary_style TEXT, family TEXT, label_source TEXT,"
+            " confidence REAL);"
+            "CREATE TABLE styles (id TEXT PRIMARY KEY, name TEXT, family TEXT, parent TEXT,"
+            " aliases TEXT, tracks INTEGER, artists INTEGER);"
+            "CREATE TABLE track_styles (rel_path TEXT, style_id TEXT, weight REAL,"
+            " source TEXT, confidence REAL, evidence TEXT);")
+        connection.executemany(
+            "INSERT INTO styles VALUES (?,?,?,?,?,?,?)",
+            [("alpha", "Alpha", "Alpha Family", None, json.dumps(["alpha alias"]), 3, 3),
+             ("beta", "Beta", "Beta Family", None, None, 3, 3),
+             ("gamma", "Gamma", "Alpha Family", None, None, 1, 1)])
+        for index, item in enumerate(AUDIO_ITEMS, start=1):
+            style = "alpha" if index % 2 else "beta"
+            connection.execute(
+                "INSERT INTO tracks (id, rel_path, name, album, album_id, album_artist,"
+                " artists, year, duration_ms, container, image_tag, album_image_tag,"
+                " raw_genre, primary_style, family, label_source, confidence)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (item["Id"], f"test/{item['Id']}.wav", item["Name"], item["Album"],
+                 item["AlbumId"], item["AlbumArtist"], ", ".join(item["Artists"]), 2024,
+                 int(item["RunTimeTicks"] / 10_000), item["Container"], "tag-1", "tag-1",
+                 "Alpha" if style == "alpha" else "Beta", style,
+                 "Alpha Family" if style == "alpha" else "Beta Family", "tag", 0.95))
+            connection.execute("INSERT INTO track_styles VALUES (?,?,?,?,?,?)",
+                               (f"test/{item['Id']}.wav", style, 1.0, "tag", 0.95, "test"))
+            if item["Id"] == "a5":
+                connection.execute("INSERT INTO track_styles VALUES (?,?,?,?,?,?)",
+                                   (f"test/{item['Id']}.wav", "gamma", 0.7, "rules", 0.9, "test"))
+                connection.execute("INSERT INTO track_styles VALUES (?,?,?,?,?,?)",
+                                   (f"test/{item['Id']}.wav", "beta", 0.5, "llm", 0.8, "test"))
+        connection.commit()
+    finally:
+        connection.close()
+    return path
+
+
+def test_catalog(report: Reporter, path: Path):
+    """The read-only catalog layer the player talks to."""
+    import catalog as catalog_module
+
+    cat = catalog_module.Catalog(path)
+    report.check("the catalog opens read-only", cat.available(), str(path))
+    stats = cat.stats()
+    report.check("stats count the tracks", stats["tracks"] == len(AUDIO_ITEMS), str(stats))
+    report.check("styles come with their counts",
+                 any(style["name"] == "Alpha" and style["tracks"] == 3 for style in cat.styles()))
+    report.check("search finds a style by name", cat.search("Alpha")[0]["name"] == "Alpha")
+    report.check("search finds a style by alias", cat.search("alpha alias")[0]["name"] == "Alpha")
+    ids, families = cat.resolve(["Alpha"])
+    report.check("a style name resolves to its id", ids == ["alpha"], str(ids))
+    ids_f, fam = cat.resolve(["family:Alpha Family"])
+    report.check("a family stays a family", fam == ["Alpha Family"] and not ids_f, str(fam))
+    report.check("count() agrees with the materialised count", cat.count(["alpha"], [], "any") == 3)
+    batch = cat.random_batch(["alpha"], [], "any", 10)
+    report.check("only matching tracks come back",
+                 {item["Id"] for item in batch} <= {"a1", "a3", "a5"},
+                 str(sorted(item["Id"] for item in batch)))
+    report.check("catalog items look like Jellyfin items",
+                 all(item.get("Id") and item.get("Name") and item.get("RunTimeTicks")
+                     for item in batch))
+    report.check("an item carries its own styles", bool(batch and batch[0].get("_styles")))
+    family_batch = cat.random_batch([], ["Alpha Family"], "any", 10)
+    report.check("a family selection includes all its styles",
+                 {item["Id"] for item in family_batch} <= {"a1", "a3", "a5"}
+                 and len(family_batch) == 3,
+                 str(sorted(item["Id"] for item in family_batch)))
+    both = cat.resolve(["Alpha", "Gamma"])[0]
+    report.check("'all of' needs every style", cat.count(both, [], "all") == 1,
+                 str(cat.count(both, [], "all")))
+    report.check("'not' excludes the selection", cat.count(["alpha"], [], "not") == 3)
+    report.check("matches() agrees for a member", cat.matches({"Id": "a1"}, ["alpha"], [], "any"))
+    report.check("matches() agrees for a non-member",
+                 not cat.matches({"Id": "a2"}, ["alpha"], [], "any"))
+    info = cat.track_styles("a5")
+    report.check("track_styles returns the tag and every style",
+                 info.get("raw_genre") == "Alpha" and len(info.get("styles") or []) == 3,
+                 str(info.get("styles")))
+    report.check("an unknown style is refused", _refuses(cat, "not a style at all"))
+    return cat
+
+
+def _refuses(cat, name) -> bool:
+    try:
+        cat.resolve([name])
+    except JellyfinError:
+        return True
+    return False
+
+
+def _refuses_filter(engine) -> bool:
+    """Nothing matches Alpha+Beta+'not' - the filter must refuse to change."""
+    try:
+        engine.set_style_filter(["Alpha", "Beta"], "not")
+    except JellyfinError:
+        return True
+    return False
+
+
+def test_style_filter(report: Reporter, client: JellyfinClient, cat) -> None:
+    """The seam between the queue/engine and the catalog."""
+    queue = PlayQueue(client, source=lambda limit: cat.random_batch(["alpha"], [], "any", limit))
+    report.check("the queue can be fed by the catalog", queue.ensure_batch(timeout=5))
+    picked = {queue.pick()["Id"] for _ in range(3)}
+    report.check("the queue keeps to the selection", picked <= {"a1", "a3", "a5"}, str(picked))
+
+    engine = PlayerEngine(client, volume=0, catalog=cat, style_filter=["Alpha"])
+    try:
+        report.check("the engine reports the filter",
+                     engine.snapshot()["filter"] == {"entries": ["Alpha"], "mode": "any"},
+                     str(engine.snapshot()["filter"]))
+        report.check("the engine uses the catalog as its source",
+                     engine.queue._source != client.random_batch)
+        engine.set_style_filter([])
+        report.check("clearing the filter restores the classic source",
+                     engine.queue._source == client.random_batch)
+        report.check("the snapshot shows no filter",
+                     engine.snapshot()["filter"]["entries"] == [])
+        engine.set_style_filter(["Beta"])
+        report.check("a track outside the filter is detected",
+                     not engine._matches_filter({"Id": "a1"}))
+        report.check("a track inside the filter is detected",
+                     engine._matches_filter({"Id": "a2"}))
+        report.check("a selection with no tracks is refused", _refuses_filter(engine))
+        report.check("the refused selection did not change the filter",
+                     engine.snapshot()["filter"]["entries"] == ["Beta"])
+        # a1 is Alpha, a2 is Beta: with the Alpha filter the queued a2 is outside.
+        engine.set_style_filter(["Alpha"])
+        engine._seq = [{"Id": "a1"}, {"Id": "a2"}]
+        engine._pos = 0
+        item, _sequential = engine._advance_target()
+        report.check("Next skips a queued track outside the filter",
+                     item is None or item.get("Id") != "a2", str(item))
+        engine.set_style_filter([])
+        engine._seq = [{"Id": "a1"}, {"Id": "a2"}]
+        engine._pos = 0
+        item, sequential = engine._advance_target()
+        report.check("without a filter the walking order is untouched",
+                     bool(item) and item["Id"] == "a2" and sequential, str(item))
+    finally:
+        engine.stop()
+
+
 def main() -> int:
     report = Reporter()
     server, port = start_server()
@@ -714,8 +1327,15 @@ def main() -> int:
         test_preloader(report, client)
         print("\nPlayback engine (silent, volume 0)")
         engine = test_engine(report, client)
+        print("\nStyle catalog and style filter")
+        test_style_filter(report, client, test_catalog(report, build_fake_catalog(_TMP / "fake-catalog.sqlite")))
         print("\nUser interface")
         test_ui(report)
+        print("\nOverlays (help card, style picker)")
+        test_overlays(report)
+        test_style_panel(report)
+        print("\nRemembering the style filter")
+        test_style_config(report)
         print("\nLauncher and application icon")
         test_launcher(report)
         print("\nSingle instance")

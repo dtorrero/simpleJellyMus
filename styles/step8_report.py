@@ -46,26 +46,34 @@ def search_styles(connection, text: str, limit: int = 15) -> List[Dict[str, Any]
         keys = [row["search_key"] or normalize_raw(row["name"])]
         keys += [normalize_raw(alias) for alias in json.loads(row["aliases"] or "[]")]
         best = 0.0
+        best = 0.0
+        specific = 0
         for key in keys:
             if not key:
                 continue
             words = len(key.split())
+            score = 0.0
             if key == query:
-                best = max(best, 3.0)
+                score = 3.0
             elif words <= 3 and (query in key or key in query):
-                best = max(best, 2.4)
+                score = 2.4
             elif query in key or key in query:
-                best = max(best, 1.5)
+                score = 1.5
             elif words <= 4:
                 shared = len(set(query.split()) & set(key.split()))
                 if shared:
-                    best = max(best, 1.0 + 0.1 * shared)
+                    score = 1.0 + 0.1 * shared
+            if not score:
+                continue
+            weight = len(key) if score >= 1.5 else -len(key)
+            if score > best or (score == best and weight > specific):
+                best, specific = score, weight
         if row["family"] and normalize_raw(row["family"]) == query:
             best += 1.2
         if best:
-            scored.append((best, row["tracks"] or 0, dict(row)))
-    scored.sort(key=lambda item: (-item[0], -item[1]))
-    results = [item[2] for item in scored[:limit]]
+            scored.append((best, specific, row["tracks"] or 0, dict(row)))
+    scored.sort(key=lambda item: (-item[0], -item[1], -item[2]))
+    results = [item[3] for item in scored[:limit]]
     # Typing a family ("metal", "punk") should offer the family itself first:
     # it is the widest useful answer, and the player treats it as one filter.
     families = {normalize_raw(row["family"]): row["family"] for row in
