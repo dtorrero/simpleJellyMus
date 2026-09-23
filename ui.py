@@ -15,6 +15,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageTk
 
+import dnd                 # drops from the file manager (optional, never fatal)
+import localmedia          # artwork of a dropped file
 from jellyfin import JellyfinClient, JellyfinError
 
 BACKGROUND = "#151718"
@@ -324,6 +326,10 @@ class PlayerScreen(ThreadSafeFrame):
         self._seeking = False
         self._seek_preview = 0.0
         self._bindings: List[Any] = []
+        # Drag & drop from the file manager: the tkdnd version when it is there,
+        # ``None`` when it is not (the window then simply has no drop target).
+        self._dnd_version: Optional[str] = None
+        self._drop_button_label = ""
         self._cover_size = self._cover_geometry()
         self._resize_job: Optional[str] = None
         self._focus_job: Optional[str] = None
@@ -354,6 +360,7 @@ class PlayerScreen(ThreadSafeFrame):
         engine.add_listener(self._on_state)
         self._apply_state(engine.snapshot())
         self._relayout(force=True)
+        self._dnd_version = self._install_drop_target()
 
     def _cover_size_for(self, height: int, width: int) -> int:
         """Biggest artwork that still leaves room for every fixed block.
@@ -558,6 +565,11 @@ class PlayerScreen(ThreadSafeFrame):
         self._build_text_block(self._stage)
         tk.Frame(self._stage, bg=BACKGROUND).pack(expand=True, fill="both")
 
+        # Shown only while a drag hovers the window. It is *placed* over the
+        # footer (never packed), so showing it cannot move anything either.
+        self._drop_hint = tk.Label(self, text="⤓  Drop to play", bg=CARD_LIGHT, fg=TEXT,
+                                   font=(self.family, 11, "bold"), padx=18, pady=9)
+
     def _build_controls(self) -> None:
         """Progress bar + transport buttons, pinned above the footer."""
         self._controls = tk.Frame(self, bg=BACKGROUND)
@@ -634,6 +646,16 @@ class PlayerScreen(ThreadSafeFrame):
                   bg=CARD_LIGHT, fg=TEXT, activebackground=CARD, activeforeground=TEXT,
                   font=(self.family, 10, "bold"), padx=14, pady=6,
                   cursor="hand2").pack(side="right", padx=(0, 8))
+        # The way back out of a dropped playlist. It is created here but never
+        # packed: appearing and disappearing must not change the height of the
+        # header (an unmanaged widget is not measured), so the artwork, the
+        # progress bar and the transport all keep the size they have today.
+        self._clear_button = tk.Button(self._header, text="Back to random",
+                                       command=self._clear_playlist, relief="flat",
+                                       borderwidth=0, bg=CARD_LIGHT, fg=TEXT,
+                                       activebackground=CARD, activeforeground=TEXT,
+                                       font=(self.family, 10, "bold"), padx=14, pady=6,
+                                       cursor="hand2")
 
     # ---------------------------------------------------------------- progress
     def _build_progress(self, parent: tk.Misc) -> None:
@@ -839,6 +861,7 @@ class PlayerScreen(ThreadSafeFrame):
         ("_restart", ("<s>", "<S>"), "restart the song"),
         ("_toggle_fullscreen", ("<f>", "<F>"), "windowed ⇄ fullscreen"),
         ("_open_style_picker", ("<g>", "<G>"), "play by style…"),
+        ("_clear_playlist", ("<c>", "<C>"), "clear a dropped playlist (back to random)"),
         ("_open_help", ("<question>", "<Shift-slash>"), "this help"),
         ("_on_quit", ("<q>", "<Q>", "<Control-q>"), "quit"),
     )
@@ -962,6 +985,9 @@ class PlayerScreen(ThreadSafeFrame):
         build(body)
         self._place_overlay()
         card.lift()
+        if self._dnd_version is not None:
+            # A drop that lands on the card must work too (it covers the screen).
+            dnd.register(card, on_drop=self._on_drop)
         return card
 
     def _close_overlay(self) -> None:
@@ -1005,6 +1031,10 @@ class PlayerScreen(ThreadSafeFrame):
                          anchor="w").grid(row=index, column=1, sticky="w", pady=1)
             tk.Label(body, text="Esc closes this", bg=CARD, fg=MUTED,
                      font=(self.family, 9)).pack(side="bottom", anchor="e")
+            tk.Label(body, text="Drag a file, a folder or a playlist from the file\n"
+                                "manager into this window to play it.",
+                     bg=CARD, fg=MUTED, font=(self.family, 9), justify="left"
+                     ).pack(side="bottom", anchor="w", pady=(8, 0))
         self._open_overlay("Keyboard shortcuts", build)
 
     def _help_rows(self) -> List[Tuple[str, str]]:
@@ -1070,6 +1100,60 @@ class PlayerScreen(ThreadSafeFrame):
                 print(f"[ui] could not save the style filter: {exc}", flush=True)
         return None
 
+    # ------------------------------------------------------------ dropped files
+    def _install_drop_target(self) -> Optional[str]:
+        """Accept files dragged from the file manager (when tkdnd is there)."""
+        version = dnd.enable(self, on_drop=self._on_drop,
+                             on_enter=self._show_drop_hint, on_leave=self._hide_drop_hint)
+        if self._debug:
+            if version is None:
+                print(f"[ui] drag & drop is off - {dnd.INSTALL_HINT}", flush=True)
+            else:
+                print(f"[ui] drag & drop ready (tkdnd {version})", flush=True)
+        return version
+
+    def _on_drop(self, data: Any) -> None:
+        """Files, folders or playlists dropped on the window: play them.
+
+        The entries are only read here (local paths *and* network locations, so
+        the player can say why a drop from a remote folder cannot be played);
+        expanding a folder tree or a playlist happens on the action thread, so
+        the window never stops responding.
+        """
+        self._hide_drop_hint()
+        try:
+            entries = dnd.parse_entries(data, self.tk.splitlist)
+        except Exception as exc:
+            print(f"[ui] could not read the dropped files: {exc}", flush=True)
+            return
+        if not entries:
+            if self._debug:
+                print("[ui] nothing to play in that drop", flush=True)
+            return
+        if self._debug:
+            print(f"[ui] dropped {len(entries)} item(s), first: {entries[0]}", flush=True)
+        self._run(self.engine.play_local, entries)
+
+    def _show_drop_hint(self) -> None:
+        """A drag is hovering the window: say what a drop would do."""
+        if not self._alive:
+            return
+        try:
+            self._drop_hint.place(relx=0.5, rely=0.965, anchor="s")
+            self._drop_hint.lift()
+        except tk.TclError:
+            pass
+
+    def _hide_drop_hint(self) -> None:
+        """The drag left (or was dropped): take the hint away again."""
+        try:
+            self._drop_hint.place_forget()
+        except tk.TclError:
+            pass
+
+    def _clear_playlist(self) -> None:
+        """The "back to random" button (and C): forget a dropped playlist."""
+        self._run(self.engine.clear_local_queue)
 
     # ------------------------------------------------------------ state updates
     def _on_state(self, state: Dict[str, Any]) -> None:
@@ -1115,7 +1199,31 @@ class PlayerScreen(ThreadSafeFrame):
             self._up_next_raw, self._status_raw, self._account_raw = hint, message, account
             self._status.configure(fg=DANGER if error else MUTED)
             self._refresh_footer()
+        self._apply_drop_state(state.get("local"))
         self._state = state
+
+    def _apply_drop_state(self, local: Any) -> None:
+        """Show the "back to random" button only while a dropped playlist runs.
+
+        The button is packed and unpacked at runtime: it has exactly the same
+        font and padding as its neighbours, so the header keeps its height and
+        the artwork keeps its size (the layout never moves).
+        """
+        info = local if isinstance(local, dict) else {}
+        active = bool(info.get("active"))
+        remaining = int(info.get("remaining") or 0)
+        label = f"Back to random ({remaining})" if active and remaining else "Back to random"
+        if label != self._drop_button_label:
+            self._drop_button_label = label
+            self._clear_button.configure(text=label)
+        try:
+            packed = bool(self._clear_button.winfo_manager())
+            if active and not packed:
+                self._clear_button.pack(side="right", padx=(0, 8))
+            elif not active and packed:
+                self._clear_button.pack_forget()
+        except tk.TclError:
+            pass
 
     def _show_item(self, item: Dict[str, Any]) -> None:
         """Update the song information labels (and the window title)."""
@@ -1140,6 +1248,10 @@ class PlayerScreen(ThreadSafeFrame):
     def _cover_key_for(self, item: Optional[Dict[str, Any]]) -> Optional[str]:
         if not item:
             return None
+        if item.get("_local_path"):
+            # A dropped file carries its own artwork (next to it or inside it),
+            # so the file itself is what the image on screen belongs to.
+            return f"local:{item['_local_path']}:{item.get('_local_cover') or ''}"
         tags = item.get("ImageTags") or {}
         tag = tags.get("Primary") or item.get("AlbumPrimaryImageTag") or "none"
         return f"{item.get('AlbumId') or item.get('Id')}:{tag}"
@@ -1161,8 +1273,12 @@ class PlayerScreen(ThreadSafeFrame):
     def _cover_worker(self, item: Dict[str, Any], key: Optional[str]) -> None:
         image: Optional[Image.Image] = None
         try:
-            path = self.client.download_image(item)
-        except JellyfinError as exc:
+            if item.get("_local_path"):
+                # A dropped file: its artwork is already on this machine.
+                path = localmedia.cover_path(item)
+            else:
+                path = self.client.download_image(item)
+        except (JellyfinError, OSError) as exc:
             if self._debug:
                 print(f"[ui] cover download failed: {exc}", flush=True)
             path = None

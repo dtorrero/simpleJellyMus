@@ -59,6 +59,19 @@ with the cover art on screen and no silence between tracks.
 * The choice is remembered, so starting the app again plays the same way - and
   `Clear` + `Play these` takes you straight back to plain random.
 
+**Playing something that is not on the server**
+
+* Drag a file, a folder or a playlist from your file manager onto the window: it
+  plays what you dropped, one track after the other, with the same cover art,
+  title, artist, album, progress bar and controls as everything else.
+* A single song, a whole album folder or a playlist (`.m3u`, `.m3u8`, `.pls`,
+  `.xspf`) - folders are walked, playlists are read, the same file is played
+  once, and anything that is not audio is left alone.
+* A **Back to random (N)** button appears in the title bar while it plays: press
+  it (or `C`) to drop the rest and go straight back to random.
+* Let it run out and the player returns to random on its own - inside your style
+  filter, if you have one picked.
+
 **Things you don't have to think about**
 
 * You log in once. Your password is never stored; only an access token, in your
@@ -98,14 +111,26 @@ for the address and login the first time you start it (see
 | Python 3.9+ (with `tkinter`) | ✅ 3.14.7 |
 | `mpv` (playback engine, used as an audio-only subprocess) | ✅ 0.41.0 |
 | Pillow (`PIL`) for cover art | ✅ 12.3.0 |
+| `tkinterdnd2` (drops from the file manager) | ✅ 0.6.3 — optional |
+| `mutagen` (tags of a dropped file) | ✅ 1.48.1 — optional |
 
 Needing to install one of them? On this machine `sudo pacman -S mpv` and, on
 other distributions, `sudo apt install mpv python3-tk` or
 `sudo dnf install mpv python3-tkinter` are usually enough.
 
 Everything else is Python's standard library (`urllib`, `json`, `socket`,
-`threading`, `tkinter`). No `pip install` is required for the current setup
-(`requirements.txt` just documents the optional dependency).
+`threading`, `tkinter`). The two optional entries above only add features - the
+player starts and plays without them:
+
+```bash
+pip install --user --break-system-packages tkinterdnd2   # drops from the file manager
+sudo pacman -S python-mutagen                            # tags of a dropped file
+```
+
+The drop support may also come from the AUR instead of pip, in which case the
+player finds it by itself: `yay -S tkdnd`. Without either of them Tk has no way
+to receive a drop, and the window simply has no drop target (start with
+`--debug` and it says so); everything else keeps working.
 
 The optional **style catalog** needs no extra Python package either: it is built
 by the scripts in `styles/`, which do want `ffprobe` on your PATH and - only for
@@ -238,6 +263,7 @@ saved). On the next start the player goes straight to the music.
 | `↑` / `↓` | volume up / down (mouse wheel works too) |
 | `,` / `.` | seek -10 s / +10 s |
 | `G` | play by style (open the style panel) |
+| `C` | clear a dropped playlist (back to random play) |
 | `?` | keyboard help (also the **?** button in the top right) |
 | `Esc` | close an open panel, otherwise switch windowed ⇄ fullscreen |
 | `F` | switch windowed ⇄ fullscreen |
@@ -245,7 +271,9 @@ saved). On the next start the player goes straight to the music.
 
 The on-screen buttons do the same: the transport row under the cover art, the
 progress bar (click or drag it to seek), and **Change account** / **Quit** /
-**?** in the top right, next to the app name.
+**?** in the top right, next to the app name. While a dropped playlist is
+playing, one more button sits there - **Back to random (N)**, with the number of
+tracks still to come (see below).
 
 ### Play by style in the player
 
@@ -270,6 +298,51 @@ replaced while the current one keeps playing (it usually has minutes left).
 The selection is remembered in the config file, so it is still there after a
 restart.
 
+### Drop a file, a folder or a playlist on it
+
+Drag anything from your file manager onto the window (Dolphin, Nautilus, Thunar,
+... - the hand-over uses the XDND protocol, which needs the optional `tkinterdnd2`
+or the AUR `tkdnd`, see [Requirements](#requirements)). The window shows a
+**⤓ Drop to play** hint while the drag hovers it, and dropping starts the first
+track right away. Everything else on screen behaves exactly as always: cover art,
+title, artist, album, progress bar, seeking, pause, next / previous, and the
+preloaded next track keeps the two songs running into each other without a gap.
+
+What a drop can be:
+
+| Dropped | What plays |
+|---|---|
+| one or more audio files | those files, in the order the file manager listed them |
+| a folder | every audio file inside it, top level first, names sorted (sub-folders included) |
+| `.m3u` / `.m3u8` | the files the playlist lists, in its order (relative entries and `file://` URIs work) |
+| `.pls` | the `FileN` entries, in N order |
+| `.xspf` | the `<location>` of every `<track>`, in document order |
+
+* Audio only, like everything else in this player: films, concert recordings and
+  music videos inside a dropped folder are ignored.
+* A drop **starts playing even if the player was paused** - it is an explicit
+  "play this".
+* Only files **on this machine** can be played. A drop from a *network* place
+  (`sftp://…`, `smb://…`) is refused with a message in the footer instead of
+  silence - mount the share (sshfs, SMB, NFS) and drop the mounted folder.
+* The same file is played once, even if it was dropped twice or sits in a folder
+  next to the playlist pointing at it. A dead entry or a stream URL in a playlist
+  is skipped rather than stopping the rest.
+* Title, artist and album come from the file's own tags (`mutagen`, if it is
+  installed) and from the file and folder names otherwise; cover art is taken
+  from the image next to the song (`cover.jpg`, `folder.png`, `front.*`, ...) or
+  out of the file itself. Without any artwork the usual placeholder is drawn.
+
+**While a dropped playlist plays** the header shows **Back to random (N)** - N
+being the tracks still to come - and `C` does the same as the button: the rest
+of the list is dropped, the queued track is taken out of mpv and a random song
+starts now. Let the list run out instead and the player goes back to random on
+its own, inside your style filter if you have one picked: a drop is a detour, not
+a mode you have to leave.
+
+Your files are only read: a drop is answered with *copy*, never *move*, so
+nothing is deleted or copied anywhere. Playlists are read, never written.
+
 ## How it works
 
 ```
@@ -282,15 +355,35 @@ Tkinter UI (ui.py) ──state snapshots── PlayerEngine (player.py)
                                           └── JellyfinClient (jellyfin.py) -> server
 ```
 
+* **Dropped files** take the same road as a random song: `dnd.py` accepts the
+  drop and hands the paths to `localmedia.py`, which expands folders and
+  playlists, reads the tags and the artwork, and returns items that carry exactly
+  the keys a Jellyfin item carries. The engine plays them from the drop queue
+  (which is simply consulted first when it picks the next track) and hands each
+  following file straight to mpv - no download, no gap. When the queue is empty
+  again the engine picks random songs exactly as before; the style filter is not
+  touched, only bypassed for as long as a drop is playing.
 * **Random songs** come from Jellyfin in random batches
   (`/Users/{id}/Items?Recursive=true&IncludeItemTypes=Audio&SortBy=Random&Limit=200`).
   Recently played tracks are skipped, and the same artist is avoided twice in a row.
   A new batch is fetched in the background before the current one runs out.
 * **Preloading**: as soon as a track starts, the next one is downloaded in the
   background to `~/.cache/simplejellymus/audio/` and appended to mpv's playlist
-  (`--prefetch-playlist=yes --gapless-audio=yes`), so the transition is instant.
+  (`--prefetch-playlist=yes --gapless-audio=weak`), so the transition is instant.
   If the download is not finished in time, the stream URL is appended instead, so
-  playback never stalls. At most 4 files are kept.
+  playback never stalls. At most 4 files are kept. `weak` keeps the sound card
+  open while the format stays the same (the usual case, so the next song runs into
+  the current one) and re-opens it when a track has another sample rate or channel
+  layout - otherwise every following track would be forced through the first
+  track's device format (a 44.1 kHz stereo FLAC came out as 22 kHz mono, and a
+  format the kept output cannot carry plays silently with the progress bar moving).
+* **The sound card always matches the track that is playing**: right after a track
+  starts, the engine compares what mpv decoded with what the open audio output is
+  set for (mpv keeps one output open across files) and asks mpv to open it again
+  when the two differ - an mp3 decodes to float, a FLAC to 16-bit, so a mixed
+  library used to hand the next file to the previous file's pipe. Tracks of the
+  same format are left alone, so the hand-over stays gapless. If a track still
+  reaches no output at all, the footer says so instead of staying silent.
 * **Cover art** is fetched from `/Items/{id}/Images/Primary` (falling back to the
   album image), cached in `~/.cache/simplejellymus/covers/` and drawn as a
   rounded square, with a generated placeholder when a release has no artwork.
@@ -325,8 +418,10 @@ Tkinter UI (ui.py) ──state snapshots── PlayerEngine (player.py)
 | `instance.py` | single-instance guard (Unix socket in `$XDG_RUNTIME_DIR`) |
 | `jellyfin.py` | Jellyfin client (login, random batches, stream/image URLs, downloads) + config storage |
 | `catalog.py` | read-only access to the local style catalog (styles, families, search, filtered random batches) |
-| `player.py` | mpv IPC client, preloader cache, random play queue, engine |
+| `player.py` | mpv IPC client, preloader cache, random play queue, drop playlist, engine |
 | `ui.py` | Tkinter login screen and fullscreen player UI (plus the `?` help and the style panel) |
+| `localmedia.py` | dropped files/folders/playlists → audio files and items (tags, cover art, playlists) |
+| `dnd.py` | drop target for the file manager (XDND via tkdnd/tkinterdnd2, optional) |
 | `selftest.py` | offline self-test: fake Jellyfin server + generated audio (see below) |
 | `styles/` | the standalone builder that produces `catalog.sqlite` (scan → link → vocabulary → normalize → optional LLM → report); it is never used while playing |
 | `install.sh` | installs/removes the menu entry and the icon (see below) |
@@ -341,8 +436,11 @@ music-only filter, cover download, the preload cache, gapless auto-advance,
 next/previous, pause, volume, seeking, the UI layout (long titles never move
 anything), the `?` help card, the style panel (search, family chips,
 `any`/`all`/`not`, applying and cancelling a choice, the "nothing matches" case,
-recalling the last choice), the catalog queries themselves, and the
-single-instance guard - **over 200 checks**, all offline.
+recalling the last choice), the catalog queries themselves, dropped files
+(folders, m3u/pls/xspf playlists, filtering, tags, cover art, playing a drop in
+order, the automatic return to random and the "back to random" button), the X11
+drop protocol itself (the test acts as the file manager and drags two files onto
+the window), and the single-instance guard - **over 250 checks**, all offline.
 
 ```bash
 python3 selftest.py            # ~1 minute, silent (volume 0)

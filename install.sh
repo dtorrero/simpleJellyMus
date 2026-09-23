@@ -125,6 +125,24 @@ uninstall() {
     say "The program itself was left untouched in $PROJECT_DIR"
 }
 
+note_optional_features() {
+    # Two extras are optional and never fatal: dropping files from the file
+    # manager needs the tkdnd Tcl extension (in the "tkinterdnd2" package or in
+    # the AUR "tkdnd"), and reading the tags of a dropped file needs mutagen.
+    # Without them the player runs and plays exactly as before - it simply offers
+    # no drop target, and names a dropped file after its file and folder names.
+    if ! python3 -c 'import tkinterdnd2' >/dev/null 2>&1 \
+        && ! compgen -G "/usr/lib/tkdnd*" >/dev/null 2>&1; then
+        say ""
+        warn "drag & drop from the file manager is off (no tkdnd found)"
+        say "  enable it with:  pip install --user --break-system-packages tkinterdnd2"
+        say "              or:  yay -S tkdnd"
+    fi
+    if ! python3 -c 'import mutagen' >/dev/null 2>&1; then
+        say "  tip: sudo pacman -S python-mutagen   # tags of a dropped file"
+    fi
+}
+
 install_app() {
     [[ -f "$PROJECT_DIR/main.py" ]] || { warn "main.py not found next to install.sh"; exit 1; }
     [[ -f "$TEMPLATE" ]] || { warn "$TEMPLATE is missing"; exit 1; }
@@ -144,6 +162,7 @@ install_app() {
     say "  launcher: $ENTRY"
     say "  command:  python3 $PROJECT_DIR/main.py"
     install_icon
+    note_optional_features
 
     if command -v desktop-file-validate >/dev/null 2>&1; then
         desktop-file-validate "$ENTRY" || warn "desktop-file-validate reported the above"

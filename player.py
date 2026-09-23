@@ -35,6 +35,8 @@ from jellyfin import (
     audio_extension,
 )
 
+import localmedia        # dropped files, folders and playlists (local only)
+
 PRELOAD_DEADLINE_SECONDS = 25.0
 PRELOAD_RETRY_SECONDS = 2.0
 LIBRARY_TIMEOUT_SECONDS = 60.0
@@ -51,6 +53,19 @@ class PlayerError(Exception):
 
 # Feeds the per-instance IPC socket name (see MpvPlayer.__init__).
 _PLAYER_INSTANCES = itertools.count(1)
+
+
+# Sample formats mpv reports: the trailing "p" only means "planar", which is an
+# internal detail - a card opened for "float" plays "floatp" data as well.
+_PLANAR_FORMATS = ("u8", "s16", "s32", "s64", "float", "double")
+
+
+def _normalise_format(name: Any) -> str:
+    """The sample format without its planar marker ("floatp" is "float")."""
+    text = str(name or "").lower()
+    if text.endswith("p") and text[:-1] in _PLANAR_FORMATS:
+        return text[:-1]
+    return text
 
 
 def cleanup_stale_sockets() -> None:
@@ -127,7 +142,12 @@ class MpvPlayer:
             "--demuxer-max-bytes=64MiB",
             "--demuxer-readahead-secs=30",
             "--prefetch-playlist=yes",
-            "--gapless-audio=yes",
+            # Keep one audio output open only while the format stays the same.
+            # "yes" would force *every* following track through the first track's
+            # device format (a 44.1 kHz stereo FLAC came out resampled to the
+            # previous stream's 22 kHz mono - and a format the kept output cannot
+            # carry at all plays silently while the progress bar keeps moving).
+            "--gapless-audio=weak",
             "--volume-max=100",
             f"--volume={self.volume}",
             f"--input-ipc-server={self._socket_path}",
@@ -294,6 +314,17 @@ class MpvPlayer:
 
     def playlist_next(self) -> None:
         self._send(["playlist-next"], timeout=2.0)
+
+    def reload_audio_output(self) -> None:
+        """Re-open the audio output for the track that is playing right now.
+
+        mpv keeps one output open across files (that is what makes a hand-over
+        gapless), so a track whose sample format or rate differ from the output's
+        is pushed through the old configuration - which is how a song can play
+        with the progress bar moving and no sound at all. This asks mpv to open
+        the output again, using the format of what is really playing.
+        """
+        self._send(["ao-reload"], timeout=3.0)
 
     def set_pause(self, paused: bool) -> None:
         self._send(["set_property", "pause", bool(paused)], timeout=2.0)
@@ -638,6 +669,12 @@ class PlayerEngine:
         self._deadline: Optional[threading.Timer] = None
         self._preload_token = 0
         self._stopped = threading.Event()
+        # The drop playlist: files, folders or playlists dragged in from the file
+        # manager. Empty means the player is doing exactly what it always did
+        # (random, optionally inside the style filter) - the queue and the random
+        # picking are not touched at all while it is empty.
+        self._local_queue: Deque[Dict[str, Any]] = deque()
+        self._local_total = 0
         # The style filter. Empty means "any random song", i.e. what the player
         # has always done; it is only consulted when it holds something.
         self._filter: Dict[str, Any] = {"entries": [], "ids": [], "families": [], "mode": "any"}
@@ -673,6 +710,12 @@ class PlayerEngine:
                 "user": self.client.username,
                 "filter": {"entries": list(self._filter["entries"]),
                            "mode": self._filter["mode"]},
+                # A dropped playlist is playing: the window shows the button that
+                # clears it, and the count of tracks still to come.
+                "local": {"active": self._local_total > 0,
+                          "remaining": len(self._local_queue)
+                                       + (1 if self._is_local(self._pending_next) else 0),
+                          "total": self._local_total},
             }
 
     # -------------------------------------------------------------- style filter
@@ -745,8 +788,21 @@ class PlayerEngine:
 
         return from_catalog
 
+    def _is_local(self, item: Optional[Dict[str, Any]]) -> bool:
+        """True for a track that came from a drop instead of from Jellyfin."""
+        return bool(item and item.get("_local_path"))
+
     def _matches_filter(self, item: Optional[Dict[str, Any]]) -> bool:
-        """Is *item* inside the current selection? (no filter: always true)"""
+        """Is *item* inside the current selection? (no filter: always true)
+
+        A track that came from a drop is always allowed - it plays because it was
+        dragged in, not because of a style - but only while its playlist is still
+        active. That single rule also keeps a dropped track that is still sitting
+        in the history from being handed out again after the list was cleared.
+        """
+        if self._is_local(item):
+            with self._lock:
+                return self._local_total > 0
         with self._lock:
             has_filter = bool(self._filter.get("entries"))
             ids = list(self._filter.get("ids") or [])
@@ -909,8 +965,90 @@ class PlayerEngine:
             self._set_error(str(exc))
         self._emit()
 
+    # ------------------------------------------------------------- dropped files
+    def play_local(self, paths: Sequence[Any]) -> int:
+        """Play files, folders or playlists dropped on the window.
+
+        The drop is expanded here - on the caller's thread, which is the UI action
+        thread - the first track starts immediately, and the rest wait in the drop
+        playlist. Once that list runs out the engine simply carries on with what
+        it was doing before: random, or random inside the style filter.
+
+        Returns how many tracks were queued. A drop that holds no playable audio
+        changes nothing and says so in the footer.
+        """
+        if self._stopped.is_set():
+            return 0
+        self._set_status("Looking at what you dropped…")
+        self._emit()
+        items = localmedia.build_items(localmedia.expand_paths(paths))
+        if not items:
+            self._set_error(localmedia.nothing_to_play_reason(paths))
+            self._emit()
+            return 0
+        with self._lock:
+            self._local_queue = deque(dict(item) for item in items[1:])
+            self._local_total = len(items)
+            paused = self._paused
+        first = items[0]
+        if self.debug:
+            print(f"[engine] dropped playlist: {len(items)} track(s) starting with "
+                  f"{JellyfinClient.display_title(first)!r}", flush=True)
+        if paused:
+            # A drop is an explicit "play this": the new track must not inherit a
+            # pause that was still set (mpv keeps it across files), or the drop
+            # would look like it does nothing at all.
+            self._paused = False
+            try:
+                self.mpv.set_pause(False)
+            except PlayerError as exc:
+                self._set_error(str(exc))
+        with self._transition:
+            self._begin_item(first, direction="new", reload=True)
+        return len(items)
+
+    def clear_local_queue(self) -> None:
+        """Forget a dropped playlist and go back to the normal random play.
+
+        The tracks that have not played yet are dropped, the one already queued
+        behind the current song is taken out of mpv again, and a random (or style
+        filtered) track starts right away - so the button really does put the
+        player back where it was before the drop.
+        """
+        with self._lock:
+            active = self._local_total > 0 or bool(self._local_queue)
+            self._local_queue.clear()
+            self._local_total = 0
+            queued_local = self._is_local(self._pending_next)
+        if queued_local:
+            self.preloader.cancel()
+            with self._lock:
+                self._pending_next = None
+                self._pending_entry = None
+                self._appended = False
+            try:
+                self.mpv.clear_playlist()
+            except PlayerError:
+                pass
+        if not active:
+            return
+        if self.debug:
+            print("[engine] dropped playlist cleared - back to random play", flush=True)
+        item = self._pick_item()
+        if item is None:
+            self._delayed(PRELOAD_RETRY_SECONDS, self._advance_after_end)
+            return
+        self._begin_item(item, direction="new", reload=True)
 
     # ------------------------------------------------------------ internal core
+    def _source_for(self, item: Dict[str, Any]) -> str:
+        """What mpv should open: a dropped file, the preload cache, or the stream."""
+        local = item.get("_local_path")
+        if local:
+            return str(local)          # already on this machine: nothing to fetch
+        cached = self.preloader.cached_path(item)
+        return str(cached) if cached is not None else self.client.stream_url(item)
+
     def _begin_item(self, item: Dict[str, Any], *, direction: str, reload: bool) -> None:
         """Make *item* the current track and queue the preload of the next one.
 
@@ -943,13 +1081,16 @@ class PlayerEngine:
                 self._pending_sequential = False
                 self._appended = False
                 self._current = item
+                if not self._is_local(item) and not self._local_queue:
+                    # The dropped playlist is over (or was skipped past its last
+                    # track): the window drops its "back to random" button again.
+                    self._local_total = 0
                 self._position = 0.0
                 self._duration = JellyfinClient.duration_seconds(item)
                 self._error = ""
                 self._status = f"Playing {JellyfinClient.display_title(item)}"
             if reload:
-                cached = self.preloader.cached_path(item)
-                source = str(cached) if cached is not None else self.client.stream_url(item)
+                source = self._source_for(item)
                 try:
                     self._current_entry = self.mpv.load(source)
                 except PlayerError as exc:
@@ -964,6 +1105,11 @@ class PlayerEngine:
                 self._pending_entry = None
             self._emit()
             self._schedule_preload()
+            # Right after a track starts, make sure the sound card is set up for
+            # *this* file (mpv keeps the previous track's output open), and a
+            # moment later check that the track really reaches the card.
+            self._delayed(0.4, self._fit_audio_output)
+            self._delayed(2.5, self._check_audio_output)
             if self.debug and item.get("_styles"):
                 print(f"[engine] playing {JellyfinClient.display_title(item)}"
                       f" [{', '.join(item['_styles'])}]", flush=True)
@@ -989,6 +1135,9 @@ class PlayerEngine:
         if item is None:
             self._delayed(PRELOAD_RETRY_SECONDS, lambda: self._schedule_preload(attempt + 1))
             return
+        if self._is_local(item):
+            self._append_local(item)       # a dropped file needs no download
+            return
         self._preload_token = self.preloader.request(item, self._on_preload_ready)
         self._arm_deadline()
 
@@ -1011,6 +1160,99 @@ class PlayerEngine:
                 self._pending_entry = entry
                 self._appended = entry is not None
             self._emit()
+
+    def _append_local(self, item: Dict[str, Any]) -> None:
+        """Queue a dropped (already local) file right behind the current track.
+
+        Local files are handed to mpv the moment they are known instead of being
+        downloaded first, so a dropped playlist keeps running into the next song
+        without a gap - and the preload deadline, which exists to cover a slow
+        download, never has to fire for them.
+        """
+        with self._transition:
+            with self._lock:
+                if self._stopped.is_set() or self._pending_next is None:
+                    return
+                if item.get("Id") != self._pending_next.get("Id"):
+                    return
+            path = item.get("_local_path")
+            if not path:
+                return
+            try:
+                entry = self.mpv.append(str(path))
+            except PlayerError as exc:
+                self._set_error(str(exc))
+                return
+            with self._lock:
+                self._pending_entry = entry
+                self._appended = entry is not None
+            self._emit()
+
+    def _fit_audio_output(self) -> None:
+        """Make the sound card follow the track that is playing, if it has to.
+
+        mpv opens one audio output and keeps it for the following tracks (that is
+        what makes the hand-over gapless), so a track whose *sample format* differs
+        from the open output's is handed to the old configuration: an mp3 (decoded
+        as float) played after a FLAC (decoded as 16-bit) goes into the card's
+        16-bit pipe. Usually mpv converts silently - but that is exactly the state
+        in which a song plays with the progress bar moving and nothing to hear, so
+        whenever the two disagree the output is opened again for what is playing.
+        """
+        try:
+            decoded = self.mpv.get("audio-params") or {}
+            output = self.mpv.get("audio-out-params") or {}
+        except PlayerError:
+            return
+        if not decoded or not output:
+            return                      # no output open yet (or nothing playing)
+        wanted = (_normalise_format(decoded.get("format")), decoded.get("samplerate"),
+                  decoded.get("channel-count"))
+        current = (_normalise_format(output.get("format")), output.get("samplerate"),
+                   output.get("channel-count"))
+        if wanted == current:
+            return                      # the card is already set up for this track
+        try:
+            self.mpv.reload_audio_output()
+        except PlayerError as exc:
+            if self.debug:
+                print(f"[engine] could not re-open the audio output: {exc}", flush=True)
+            return
+        if self.debug:
+            print(f"[engine] the sound card was open for {current} - opening it again "
+                  f"for {wanted}", flush=True)
+
+    def _check_audio_output(self) -> None:
+        """Say so when mpv is playing but no sound card is receiving anything.
+
+        The one failure that looks like nothing is wrong: the track is running
+        (the position moves, the cover shows) but mpv never got an audio output
+        open - another program holding the device, a device that vanished, a
+        server that refuses the stream. mpv reports it: while it plays, its
+        ``audio-out-params`` stay empty until an output is really there.
+        """
+        if self._stopped.is_set():
+            return
+        with self._lock:
+            item = self._current
+            paused = self._paused
+            position = self._position
+        if item is None or paused or position < 0.3:
+            return                          # not playing (yet): nothing to say
+        try:
+            if self.mpv.is_idle() or self.mpv.get("core-idle"):
+                return                      # between two tracks, or still buffering
+            if self.mpv.get("aid") in (None, "no", False):
+                return                      # this file has no audio stream at all
+            if self.mpv.get("audio-out-params"):
+                return                      # the sound card is open: all is well
+        except PlayerError:
+            return
+        if self.debug:
+            print("[engine] mpv is playing without an audio output", flush=True)
+        self._set_error("No sound: the player could not open an audio device - "
+                        "check the mixer (is another program holding the device?)")
+        self._emit()
 
     def _arm_deadline(self) -> None:
         """Fall back to streaming if the download is not finished in time."""
@@ -1080,6 +1322,10 @@ class PlayerEngine:
         return self._pick_item(), False
 
     def _pick_item(self) -> Optional[Dict[str, Any]]:
+        """The next track: from the drop playlist first, then random as ever."""
+        with self._lock:
+            if self._local_queue:
+                return dict(self._local_queue.popleft())
         item = self.queue.pick(avoid_artist=self._current_artist())
         if item is None:
             self._set_status("Fetching more songs from the server…")

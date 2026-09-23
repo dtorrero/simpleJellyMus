@@ -5,6 +5,11 @@ Spins up a tiny fake Jellyfin server (with decoy video items) and checks the
 client, the music-only filter, cover download, the preload cache, the whole
 playback engine (auto-advance, next, previous, pause, volume, seek), the UI
 layout with long titles, the launcher/icon wiring and the single-instance guard.
+Dropped files are covered too: expanding folders and m3u/pls/xspf playlists,
+reading tags and cover art, playing a drop in order, the return to random when it
+ends, the "back to random" button, the Tcl list a file manager drops, and the
+XDND exchange itself (the test plays the file manager and drops two files on the
+window over the real X11 protocol).
 
     python3 selftest.py
 
@@ -18,6 +23,7 @@ import os
 import re
 import shutil
 import struct
+import subprocess
 import tempfile
 import threading
 import time
@@ -31,7 +37,9 @@ _TMP = Path(tempfile.mkdtemp(prefix="simplejellymus-selftest-"))
 os.environ["XDG_CACHE_HOME"] = str(_TMP / "cache")
 os.environ["XDG_CONFIG_HOME"] = str(_TMP / "config")
 
-import jellyfin  # noqa: E402  (imported once the environment is ready)
+import dnd  # noqa: E402  (imported once the environment is ready)
+import jellyfin  # noqa: E402
+import localmedia  # noqa: E402
 from jellyfin import AuthError, JellyfinClient, JellyfinError  # noqa: E402
 from player import PlayerEngine, PlayQueue, Preloader  # noqa: E402
 
@@ -425,7 +433,9 @@ class _StubEngine:
 
     def __init__(self, item: Any = None) -> None:
         self.style_calls: list = []
+        self.drop_calls: list = []
         self.filter = {"entries": [], "mode": "any"}
+        self.local = {"active": False, "remaining": 0, "total": 0}
         item = item or {"Id": "x1", "Name": "Stub", "Artists": ["A"], "Album": "B"}
         self._state = {
             "current": item, "up_next": None, "position": 1.0, "duration": 10.0,
@@ -440,11 +450,26 @@ class _StubEngine:
         state = dict(self._state)
         state["filter"] = {"entries": list(self.filter["entries"]),
                            "mode": self.filter["mode"]}
+        state["local"] = dict(self.local)
         return state
+
+    def emit_local(self, active: bool, remaining: int = 0, total: int = 0) -> None:
+        """Push a state as if the engine had a dropped playlist (or lost it)."""
+        self.local = {"active": active, "remaining": remaining, "total": total}
+        self._listener(self.snapshot())
 
     def set_style_filter(self, entries: Any = None, mode: str = "any") -> None:
         self.style_calls.append((list(entries or []), mode))
         self.filter = {"entries": list(entries or []), "mode": mode}
+
+    def play_local(self, paths: Any) -> int:
+        """Record a drop the way the real engine would take it."""
+        dropped = [str(path) for path in paths]
+        self.drop_calls.append(("play", dropped))
+        return len(dropped)
+
+    def clear_local_queue(self) -> None:
+        self.drop_calls.append(("clear", []))
 
     adjust_volume = seek_relative = seek_absolute = _noop
     toggle_pause = next_track = previous_track = restart_track = _noop
@@ -1315,6 +1340,829 @@ def test_style_filter(report: Reporter, client: JellyfinClient, cat) -> None:
         engine.stop()
 
 
+# --------------------------------------------------------------------------- #
+# dropped files, folders and playlists
+# --------------------------------------------------------------------------- #
+
+LOCAL_ROOT = _TMP / "local"
+LOCAL_ALBUM = LOCAL_ROOT / "Test Artist - Test Album"
+LOCAL_LOOSE = LOCAL_ROOT / "Loose"
+LOCAL_TRACKS = {
+    "first": LOCAL_ALBUM / "01 - First Song.wav",
+    "second": LOCAL_ALBUM / "02 - Second Song.wav",
+    "third": LOCAL_ALBUM / "03 - Third Song.wav",
+    "loose": LOCAL_LOOSE / "Loose Track.wav",
+}
+
+
+def build_stereo_wav(path: Path, seconds: float = 3.0, rate: int = 44100) -> Path:
+    """A CD-format stereo WAV (a *different* format than the library tracks).
+
+    Used to check that the sound card follows the file that is playing instead of
+    being stuck on the format of whatever played before it.
+    """
+    frames = bytearray()
+    for index in range(int(rate * seconds)):
+        sample = struct.pack("<h", int(3000 * math.sin(2 * math.pi * 440 * index / rate)))
+        frames.extend(sample)
+        frames.extend(sample)
+    with wave.open(str(path), "wb") as handle:
+        handle.setnchannels(2)
+        handle.setsampwidth(2)
+        handle.setframerate(rate)
+        handle.writeframes(bytes(frames))
+    return path
+
+
+def build_local_fixtures() -> None:
+    """A tiny music folder: an album, a loose track, a video decoy, a cover."""
+    LOCAL_ALBUM.mkdir(parents=True, exist_ok=True)
+    LOCAL_LOOSE.mkdir(parents=True, exist_ok=True)
+    for path in LOCAL_TRACKS.values():
+        if not path.exists():
+            path.write_bytes(build_wav(1.0))
+    (LOCAL_ALBUM / "cover.jpg").write_bytes(COVER_BYTES)
+    (LOCAL_ALBUM / "notes.txt").write_text("not music\n", encoding="utf-8")
+    # A video file must never reach the player, whatever it is called.
+    decoy = LOCAL_LOOSE / "concert.mp4"
+    if not decoy.exists():
+        decoy.write_bytes(build_wav(0.5))
+
+
+def tcl_drop(paths: Any) -> str:
+    """A drop as tkdnd hands it over: one Tcl list with braced words.
+
+    ``tkinterdnd2`` passes ``%D`` through Tcl's ``list``, so the callback gets a
+    single string in which every path that needs it is braced - this builds the
+    same thing, so the tests exercise the real code path.
+    """
+    return " ".join("{" + str(path) + "}" for path in paths)
+
+
+def _subsequence(needle: list, haystack: list) -> bool:
+    """True when *needle* appears inside *haystack*, in order."""
+    index = 0
+    for entry in haystack:
+        if index < len(needle) and entry == needle[index]:
+            index += 1
+    return index == len(needle)
+
+
+def test_local_media(report: Reporter) -> None:
+    """What a dropped file, folder or playlist turns into (no display needed)."""
+    build_local_fixtures()
+
+    # -------------------------------------------------------------- expanding
+    folder = localmedia.expand_paths([LOCAL_ALBUM])
+    report.check("a dropped folder plays its audio files, sorted",
+                 [path.name for path in folder] == ["01 - First Song.wav",
+                                                    "02 - Second Song.wav",
+                                                    "03 - Third Song.wav"],
+                 str([path.name for path in folder]))
+    loose = localmedia.expand_paths([LOCAL_LOOSE])
+    report.check("a folder drop leaves videos and other files alone",
+                 [path.name for path in loose] == ["Loose Track.wav"],
+                 str([path.name for path in loose]))
+    report.check("a single dropped file plays as it is",
+                 localmedia.expand_paths([LOCAL_TRACKS["loose"]]) == [LOCAL_TRACKS["loose"]])
+    report.check("a dropped folder is walked into its sub-folders",
+                 set(localmedia.expand_paths([LOCAL_ROOT])) == set(LOCAL_TRACKS.values()),
+                 str(sorted(path.name for path in localmedia.expand_paths([LOCAL_ROOT]))))
+    report.check("dropping the same file twice plays it once",
+                 len(localmedia.expand_paths([LOCAL_ALBUM, LOCAL_TRACKS["first"],
+                                              LOCAL_ALBUM])) == 3)
+    report.check("a path that is not there is skipped",
+                 localmedia.expand_paths([LOCAL_ROOT / "gone.mp3",
+                                          LOCAL_ROOT / "gone"]) == [])
+    report.check("dropping nothing expands to nothing",
+                 localmedia.expand_paths([]) == [] and localmedia.expand_paths(None) == [])
+
+    # -------------------------------------------------------------- playlists
+    m3u = LOCAL_ROOT / "list.m3u"
+    m3u.write_text("#EXTM3U\n"
+                   "\n"
+                   "Test Artist - Test Album/02 - Second Song.wav\n"
+                   f"file://{LOCAL_TRACKS['third']}\n"
+                   "http://radio.example/stream.mp3\n"
+                   "Test Artist - Test Album/gone.wav\n", encoding="utf-8")
+    report.check("an m3u plays the files it lists, in its order",
+                 localmedia.expand_paths([m3u]) == [LOCAL_TRACKS["second"],
+                                                    LOCAL_TRACKS["third"]],
+                 str([path.name for path in localmedia.expand_paths([m3u])]))
+
+    pls = LOCAL_ROOT / "list.pls"
+    pls.write_text(f"[playlist]\nFile2={LOCAL_TRACKS['third']}\n"
+                   f"File1={LOCAL_TRACKS['first']}\nTitle1=First\n"
+                   "NumberOfEntries=2\n", encoding="utf-8")
+    report.check("a pls plays its FileN entries in N order",
+                 localmedia.expand_paths([pls]) == [LOCAL_TRACKS["first"],
+                                                    LOCAL_TRACKS["third"]],
+                 str([path.name for path in localmedia.expand_paths([pls])]))
+
+    xspf = LOCAL_ROOT / "list.xspf"
+    xspf.write_text('<?xml version="1.0"?>\n<playlist version="1" '
+                    'xmlns="http://xspf.org/ns/0/"><trackList><track><location>'
+                    + LOCAL_TRACKS["loose"].as_uri()
+                    + "</location></track></trackList></playlist>", encoding="utf-8")
+    report.check("an xspf plays the location of its tracks",
+                 localmedia.expand_paths([xspf]) == [LOCAL_TRACKS["loose"]],
+                 str([path.name for path in localmedia.expand_paths([xspf])]))
+    report.check("a playlist next to the folder does not repeat its files",
+                 len(localmedia.expand_paths([m3u, pls, LOCAL_TRACKS["first"]])) == 3,
+                 str([path.name for path in localmedia.expand_paths([m3u, pls,
+                                                                    LOCAL_TRACKS["first"]])]))
+
+    # ------------------------------------------------------------------ items
+    items = localmedia.build_items(localmedia.expand_paths([m3u]))
+    report.check("a dropped file becomes an item the window can show",
+                 all(item.get("Id") and item.get("Name") and item.get("_local_path")
+                     and item.get("Type") == "Audio" for item in items), str(items[:1]))
+    report.check("the item id is stable and marked as local",
+                 items[0]["Id"] == localmedia.local_id(LOCAL_TRACKS["second"])
+                 and items[0]["Id"].startswith("local:"), items[0]["Id"])
+    report.check("the file name is the title, without its track number",
+                 items[0]["Name"] == "Second Song", items[0]["Name"])
+    report.check("an \"Artist - Album\" folder names the artist and the album",
+                 JellyfinClient.display_artist(items[0]) == "Test Artist"
+                 and items[0]["Album"] == "Test Album",
+                 f"{JellyfinClient.display_artist(items[0])} / {items[0]['Album']}")
+    report.check("the display helpers accept a local item",
+                 JellyfinClient.display_title(items[0]) == "Second Song"
+                 and JellyfinClient.is_music(items[0]))
+    report.check("cover art next to the song is used",
+                 localmedia.cover_path(items[0]) == LOCAL_ALBUM / "cover.jpg",
+                 str(localmedia.cover_path(items[0])))
+    coverless = localmedia.build_items([LOCAL_TRACKS["loose"]])[0]
+    report.check("a file without any artwork has no cover",
+                 localmedia.cover_path(coverless) is None,
+                 str(localmedia.cover_path(coverless)))
+    report.check("a drop from a network location explains itself",
+                 "network location" in localmedia.nothing_to_play_reason(
+                     ["sftp://pi/music/A Song.flac"]),
+                 localmedia.nothing_to_play_reason(["sftp://pi/music/A Song.flac"]))
+    report.check("a drop without audio keeps the plain explanation",
+                 localmedia.nothing_to_play_reason([LOCAL_ALBUM / "notes.txt"])
+                 == "Nothing to play in that drop - no audio files were found",
+                 localmedia.nothing_to_play_reason([LOCAL_ALBUM / "notes.txt"]))
+    if localmedia.HAS_MUTAGEN:
+        report.check("the duration comes from the file itself",
+                     JellyfinClient.duration_seconds(items[0]) > 0.5,
+                     f"{JellyfinClient.duration_seconds(items[0]):.2f}s")
+    else:
+        print("  [skip] mutagen is not installed - names come from the file names")
+
+    # ------------------------------------------------- tags inside a real file
+    ffmpeg = shutil.which("ffmpeg")
+    if not (localmedia.HAS_MUTAGEN and ffmpeg):
+        print("  [skip] mutagen and ffmpeg are both needed to build a tagged file")
+        return
+    tagged = LOCAL_ROOT / "tagged.mp3"
+    tagged_cover = LOCAL_ROOT / "embedded.jpg"
+    plain = LOCAL_ROOT / "plain.mp3"
+    tagged_cover.write_bytes(COVER_BYTES)
+    # Two steps, the way ffmpeg documents it: a tagged mp3, then the cover in.
+    steps = ([ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+              "-f", "lavfi", "-i", "anullsrc=r=22050:cl=mono", "-t", "2",
+              "-c:a", "libmp3lame",
+              "-metadata", "title=Tagged Title", "-metadata", "artist=Tagged Artist",
+              "-metadata", "album=Tagged Album", "-metadata", "track=7", str(plain)],
+             [ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+              "-i", str(plain), "-i", str(tagged_cover),
+              "-map", "0:a", "-map", "1:v", "-c", "copy", "-id3v2_version", "3",
+              "-metadata:s:v", "title=Album cover",
+              "-metadata:s:v", "comment=Cover (front)", str(tagged)])
+    try:
+        for command in steps:
+            subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=90, check=True)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"  [skip] could not build a tagged file with ffmpeg ({exc})")
+        return
+    item = localmedia.build_items([tagged])[0]
+    report.check("the tags name a dropped file (title/artist/album/track)",
+                 (item["Name"], JellyfinClient.display_artist(item), item["Album"],
+                  item["IndexNumber"]) == ("Tagged Title", "Tagged Artist",
+                                           "Tagged Album", 7),
+                 f"{item['Name']} / {JellyfinClient.display_artist(item)} / "
+                 f"{item['Album']} / {item['IndexNumber']}")
+    report.check("the duration of a tagged file is known",
+                 JellyfinClient.duration_seconds(item) > 1.0,
+                 f"{JellyfinClient.duration_seconds(item):.2f}s")
+    cover = localmedia.cover_path(item)
+    report.check("artwork stored inside the file is extracted for the window",
+                 cover is not None and cover.is_file() and cover.stat().st_size > 0,
+                 str(cover))
+    if cover is not None:
+        from PIL import Image
+
+        with Image.open(cover) as image:
+            report.check("the extracted cover is a real image", image.size[0] >= 100,
+                         str(image.size))
+
+
+def test_drop_parsing(report: Reporter) -> None:
+    """What the file manager hands over: a Tcl list of paths (the XDND drop)."""
+    report.check("a list of dropped paths is read",
+                 dnd.parse_paths("/music/a.mp3 /music/b.flac")
+                 == [Path("/music/a.mp3"), Path("/music/b.flac")])
+    report.check("a file name with spaces survives the Tcl list",
+                 dnd.parse_paths("{/music/my song.mp3}") == [Path("/music/my song.mp3")],
+                 str(dnd.parse_paths("{/music/my song.mp3}")))
+    report.check("a file name with brackets and a backslash survives too",
+                 dnd.parse_paths("{/music/rock [live]/c\\d.mp3}")
+                 == [Path("/music/rock [live]/c\\d.mp3")],
+                 str(dnd.parse_paths("{/music/rock [live]/c\\d.mp3}")))
+    report.check("a file:// URI is decoded",
+                 dnd.parse_paths("file:///music/a%20b.mp3") == [Path("/music/a b.mp3")],
+                 str(dnd.parse_paths("file:///music/a%20b.mp3")))
+    report.check("a stream URL is not a local file",
+                 dnd.parse_paths("https://radio.example/live.mp3") == [])
+    report.check("an empty drop reads as nothing",
+                 dnd.parse_paths("") == [] and dnd.parse_paths(None) == []
+                 and dnd.parse_paths("{}") == [])
+    report.check("parsing works without a Tcl interpreter as well",
+                 dnd.parse_paths("/music/a.mp3", splitlist=lambda text: text.split("\n"))
+                 == [Path("/music/a.mp3")])
+    report.check("paths that are already split are accepted too",
+                 dnd.parse_paths(["/music/a b.mp3", "/music/c.flac"])
+                 == [Path("/music/a b.mp3"), Path("/music/c.flac")],
+                 str(dnd.parse_paths(["/music/a b.mp3", "/music/c.flac"])))
+    report.check("a network location is recognised (and not played as a file)",
+                 dnd.parse_entries("sftp://pi/music/a.flac") == ["sftp://pi/music/a.flac"]
+                 and dnd.parse_paths("sftp://pi/music/a.flac") == []
+                 and dnd.remote_entries(["sftp://pi/a.flac", "/local/b.flac"])
+                 == ["sftp://pi/a.flac"],
+                 str(dnd.parse_entries("sftp://pi/music/a.flac")))
+    if dnd.available():
+        report.check("drag & drop support is installed", True,
+                     "tkinterdnd2" if dnd._tkinterdnd2() else str(dnd._system_directory()))
+    else:
+        print(f"  [skip] {dnd.INSTALL_HINT}")
+
+
+def test_dropped_playlist(report: Reporter, client: JellyfinClient) -> None:
+    """A drop plays in order, then the player quietly returns to random.
+
+    The dropped files last a second each, so the whole detour - drop it, play it
+    through, land back in the library - takes only a few seconds.
+    """
+    build_local_fixtures()
+    drop = [LOCAL_TRACKS["loose"], LOCAL_TRACKS["first"], LOCAL_TRACKS["second"]]
+    engine = PlayerEngine(client, volume=0, debug=bool(os.environ.get("SELFTEST_DEBUG")))
+    played: list = []
+
+    def listener(state) -> None:
+        name = (state.get("current") or {}).get("Name")
+        if name and (not played or played[-1] != name):
+            played.append(name)
+
+    def library_track(state):
+        """The current track when it came from Jellyfin (dropped ones are local)."""
+        item = state.get("current") or {}
+        return item if str(item.get("Id", "")).startswith("a") else None
+
+    def local_track(state):
+        """The current track when it is a file that was dropped on the window."""
+        item = state.get("current") or {}
+        return item if item.get("_local_path") else None
+
+    engine.add_listener(listener)
+    try:
+        engine.start()
+        report.check("the engine plays a random track before the drop",
+                     wait_for(lambda: library_track(engine.snapshot()), 30) is not None)
+        report.check("dropping three files queues three tracks",
+                     engine.play_local(drop) == 3)
+        started = wait_for(lambda: local_track(engine.snapshot()), 15)
+        report.check("the first dropped file starts playing at once", started is not None,
+                     str(engine.snapshot().get("current")))
+        report.check("a dropped track points at its own file",
+                     bool(started and started.get("_local_path")), str(started))
+        report.check("the snapshot says a dropped playlist is playing",
+                     wait_for(lambda: engine.snapshot()["local"]["active"], 5) is not None)
+        report.check("and counts the tracks still to come",
+                     engine.snapshot()["local"]["remaining"] >= 1,
+                     str(engine.snapshot()["local"]))
+        report.check("the drop runs to its end and the player returns to random",
+                     wait_for(lambda: library_track(engine.snapshot()), 45) is not None)
+        report.check("the dropped tracks played in the order they were dropped",
+                     _subsequence(["Loose Track", "First Song", "Second Song"], played),
+                     " -> ".join(played))
+        report.check("once it is over no dropped playlist is reported any more",
+                     not engine.snapshot()["local"]["active"]
+                     and engine.snapshot()["local"]["remaining"] == 0,
+                     str(engine.snapshot()["local"]))
+
+        # ------------------------------------------------- clearing it on purpose
+        report.check("a second drop is queued again", engine.play_local(drop) == 3)
+        report.check("the second drop starts playing too",
+                     wait_for(lambda: local_track(engine.snapshot()), 15) is not None)
+        engine.clear_local_queue()
+        report.check("clearing a dropped playlist goes back to random at once",
+                     wait_for(lambda: library_track(engine.snapshot()), 45) is not None)
+        report.check("a cleared playlist reports no drop any more",
+                     not engine.snapshot()["local"]["active"]
+                     and engine.snapshot()["local"]["remaining"] == 0,
+                     str(engine.snapshot()["local"]))
+
+        # ------------------------------------------------------------ the seam
+        item = localmedia.build_items([LOCAL_TRACKS["loose"]])[0]
+        with engine._lock:
+            engine._local_total = 1
+        report.check("a dropped track is never filtered away by a style filter",
+                     engine._matches_filter(item))
+        with engine._lock:
+            engine._local_total = 0
+        report.check("and is not handed out again once the list was cleared",
+                     not engine._matches_filter(item))
+
+        # --------------------------------------------------- folders and non-music
+        report.check("dropping a folder plays only the audio inside it",
+                     engine.play_local([LOCAL_LOOSE]) == 1)
+        report.check("a drop without a single audio file changes nothing",
+                     engine.play_local([LOCAL_ALBUM / "notes.txt"]) == 0
+                     and "no audio" in engine.snapshot()["error"],
+                     engine.snapshot()["error"])
+        report.check("a drop from a network location says so instead",
+                     engine.play_local(["sftp://pi/music/A Song.flac"]) == 0
+                     and "network location" in engine.snapshot()["error"],
+                     engine.snapshot()["error"])
+
+        # ------------------------------------------------------- the sound card
+        # Playing silently (the position runs, nothing comes out) must not be a
+        # mystery: the engine checks a moment after each track starts and says so
+        # in the footer. A healthy player must never trigger it.
+        engine.play_local([LOCAL_TRACKS["first"]])
+        time.sleep(4)                       # longer than the check's delay
+        report.check("playing a dropped file does not warn about the sound card",
+                     engine.snapshot()["error"] == "", engine.snapshot()["error"])
+
+        # ------------------------------------------------------- the sound card
+        # A dropped file can have a different format than the track before it (the
+        # player's library tracks are 22 kHz mono here, this one is 44.1 kHz
+        # stereo). mpv must follow the *file*, not stay on the old format - with
+        # "gapless-audio=yes" it stayed, which made a dropped CD-format song come
+        # out resampled (or silent, for formats the kept output cannot carry).
+        cd_format = build_stereo_wav(LOCAL_ROOT / "cd format.wav")
+        engine.play_local([cd_format])
+        reported = None
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            out = engine.mpv.get("audio-out-params") or {}
+            if out.get("samplerate") == 44100 and out.get("channel-count") == 2:
+                reported = out
+                break
+            time.sleep(0.2)
+        report.check("the sound card follows the dropped file's own format",
+                     reported is not None,
+                     f"audio-out-params={engine.mpv.get('audio-out-params')} "
+                     f"audio-params={engine.mpv.get('audio-params')}")
+
+        # ------------------------------------------------- the format of each file
+        # mpv keeps the card open across files, so before this the *next* track was
+        # pushed through the previous one's format: an mp3 (decoded as float) after
+        # a 16-bit file went into the card's 16-bit pipe - the state in which a song
+        # plays with no sound at all. The engine now looks at every track that
+        # starts and opens the output again when the two disagree - and only then,
+        # so that a playlist of same-format tracks still runs gapless.
+        mp3 = LOCAL_ROOT / "mp3 format.mp3"
+        ffmpeg = shutil.which("ffmpeg")
+        if not mp3.exists() and ffmpeg:
+            subprocess.run([ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                            "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo", "-t", "4",
+                            "-c:a", "libmp3lame", str(mp3)], check=False)
+        if mp3.exists():
+            reloads = {"count": 0}
+            real_reload = engine.mpv.reload_audio_output
+
+            def counting_reload() -> None:
+                reloads["count"] += 1
+                real_reload()
+
+            engine.mpv.reload_audio_output = counting_reload
+            engine.play_local([cd_format])          # a 16-bit stereo track first
+            wait_for(lambda: (engine.mpv.get("audio-out-params") or {}).get("format") == "s16", 10)
+            engine.play_local([mp3])                # decodes to float
+            wait_for(lambda: reloads["count"] > 0, 6)
+            report.check("the sound card is opened again for a file of another format",
+                         reloads["count"] > 0,
+                         f"reopens={reloads['count']} "
+                         f"out={engine.mpv.get('audio-out-params')} "
+                         f"params={engine.mpv.get('audio-params')}")
+            before = reloads["count"]
+            engine.play_local([mp3])                # same format as the card: no reopen
+            time.sleep(2.0)
+            report.check("a file whose format already matches does not re-open it",
+                         reloads["count"] == before,
+                         f"reopens={reloads['count'] - before}")
+            engine.mpv.reload_audio_output = real_reload
+        else:
+            print("  [skip] ffmpeg is needed to build an mp3 for the format check")
+
+        # ------------------------------------------------------------ while paused
+        engine.toggle_pause()
+        paused_before = engine.snapshot()["paused"]
+        engine.play_local([LOCAL_TRACKS["third"]])
+        report.check("a dropped track also plays when the player was paused",
+                     paused_before
+                     and wait_for(lambda: not engine.snapshot()["paused"], 5) is not None,
+                     f"paused {paused_before} -> {engine.snapshot()['paused']}")
+    finally:
+        engine.stop()
+
+
+def test_drop_ui(report: Reporter) -> None:
+    """The drop button, the drop hint and the C key (needs a display)."""
+    try:
+        import tkinter as tk
+
+        import ui
+    except ImportError as exc:
+        report.check(f"tkinter is importable ({exc})", False)
+        return
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        print(f"  [skip] no display for the drop checks ({exc})", flush=True)
+        return
+
+    def pump(seconds: float) -> None:
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            root.update()
+            time.sleep(0.02)
+
+    def layout() -> tuple:
+        """Everything on screen that a drop must never move."""
+        return (screen._cover_size, screen._progress.winfo_rooty(),
+                screen._transport.winfo_rooty(), screen._footer.winfo_rooty(),
+                screen._header.winfo_height(), screen._header.winfo_reqheight())
+
+    screen = None
+    engine = _StubEngine()
+    try:
+        root.geometry("1280x800")
+        screen = ui.PlayerScreen(root, engine=engine,
+                                 client=JellyfinClient("http://127.0.0.1:1"),
+                                 family=ui.pick_font_family(),
+                                 on_change_account=_noop, on_quit=_noop)
+        screen.pack(fill="both", expand=True)
+        pump(0.6)
+        before = layout()
+
+        # ------------------------------------------------------------ the button
+        buttons = [child for child in screen._header.winfo_children()
+                   if isinstance(child, tk.Button)]
+        report.check("the \"back to random\" button starts out hidden",
+                     screen._clear_button in buttons
+                     and not screen._clear_button.winfo_manager())
+        report.check("it is exactly as tall as the buttons next to it",
+                     len({button.winfo_reqheight() for button in buttons}) == 1,
+                     str([button.winfo_reqheight() for button in buttons]))
+        report.check("the drop hint is not on screen at start",
+                     not screen._drop_hint.place_info())
+
+        engine.emit_local(True, remaining=2, total=4)
+        pump(0.3)
+        report.check("the button appears while a dropped playlist plays",
+                     bool(screen._clear_button.winfo_manager()))
+        report.check("the button counts the tracks still to come",
+                     str(screen._clear_button.cget("text")) == "Back to random (2)",
+                     str(screen._clear_button.cget("text")))
+        report.check("showing the button moves nothing", layout() == before,
+                     f"{before} -> {layout()}")
+
+        engine.emit_local(False)
+        pump(0.3)
+        report.check("the button disappears when the playlist is over",
+                     not screen._clear_button.winfo_manager())
+        report.check("hiding it again moves nothing either", layout() == before,
+                     f"{before} -> {layout()}")
+
+        # -------------------------------------------------------------- a drop
+        screen._show_drop_hint()
+        pump(0.2)
+        report.check("a hovering drag shows the drop hint",
+                     bool(screen._drop_hint.place_info()))
+        screen._on_drop("{/music/One Song.mp3} /music/Two.flac")
+        pump(0.3)
+        report.check("a drop hands the files to the engine",
+                     engine.drop_calls[-1:] == [("play", ["/music/One Song.mp3",
+                                                          "/music/Two.flac"])],
+                     str(engine.drop_calls))
+        report.check("the hint is taken away again after the drop",
+                     not screen._drop_hint.place_info())
+        screen._clear_playlist()
+        pump(0.3)
+        report.check("the button asks the engine to forget the playlist",
+                     engine.drop_calls[-1:] == [("clear", [])], str(engine.drop_calls))
+        report.check("C is bound and in the shortcut table",
+                     bool(root.bind("<c>"))
+                     and any(name == "_clear_playlist" and "<c>" in sequences
+                             for name, sequences, _t in ui.PlayerScreen._SHORTCUTS))
+
+        # -------------------------------------------------------------- the help
+        screen._open_help()
+        pump(0.2)
+        texts = widget_texts(screen._overlay) if screen._overlay is not None else []
+        report.check("the help card mentions dropping files on the window",
+                     any("Drag" in text for text in texts), str(texts)[:160])
+        screen._close_overlay()
+        pump(0.2)
+        report.check("none of the drop interface moved the layout", layout() == before,
+                     f"{before} -> {layout()}")
+
+        if screen._dnd_version is not None:
+            report.check("the window really is a drop target", True,
+                         f"tkdnd {screen._dnd_version}")
+        else:
+            print(f"  [skip] {dnd.INSTALL_HINT}")
+    finally:
+        if screen is not None:
+            screen.destroy()
+        root.destroy()
+
+
+def test_drop_end_to_end(report: Reporter, client: JellyfinClient) -> None:
+    """A drop through the real window: UI -> action thread -> engine -> mpv.
+
+    The other checks cover the two halves (the window with a stub engine, the
+    engine on its own); this one puts them together and drops a file on a real
+    PlayerScreen, exactly as the file manager would.
+    """
+    try:
+        import tkinter as tk
+
+        import ui
+    except ImportError as exc:
+        report.check(f"tkinter is importable ({exc})", False)
+        return
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        print(f"  [skip] no display for the drop end-to-end check ({exc})", flush=True)
+        return
+
+    build_local_fixtures()
+    engine = PlayerEngine(client, volume=0, debug=bool(os.environ.get("SELFTEST_DEBUG")))
+    screen = None
+
+    def pump(seconds: float) -> None:
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            root.update()
+            time.sleep(0.02)
+
+    def pump_until(predicate: Any, timeout: float) -> bool:
+        """Wait for something to appear on screen (the Tk loop must run for it)."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            root.update()
+            if predicate():
+                return True
+            time.sleep(0.02)
+        return False
+
+    def dropped_track(state):
+        item = state.get("current") or {}
+        return item if item.get("_local_path") else None
+
+    def library_track(state):
+        item = state.get("current") or {}
+        return item if str(item.get("Id", "")).startswith("a") else None
+
+    try:
+        engine.start()
+        if wait_for(lambda: engine.snapshot().get("current"), 30) is None:
+            report.check("the engine started for the drop check", False)
+            return
+        root.geometry("1280x800")
+        screen = ui.PlayerScreen(root, engine=engine, client=client,
+                                 family=ui.pick_font_family(),
+                                 on_change_account=_noop, on_quit=_noop)
+        screen.pack(fill="both", expand=True)
+        pump(0.8)
+        report.check("a real window is a drop target (tkdnd is loaded)",
+                     screen._dnd_version is not None, str(screen._dnd_version))
+        report.check("and starts without a \"back to random\" button",
+                     not screen._clear_button.winfo_manager())
+
+        # Exactly what the file manager hands over: a Tcl list of paths.
+        data = tcl_drop([LOCAL_TRACKS["loose"], LOCAL_TRACKS["first"]])
+        screen._on_drop(data)
+        report.check("a drop on the window starts playing in the player",
+                     wait_for(lambda: dropped_track(engine.snapshot()), 20) is not None,
+                     str(engine.snapshot().get("current")))
+        report.check("the window shows the dropped song's name",
+                     pump_until(lambda: "Loose Track" in str(screen._title.cget("text")), 10),
+                     str(screen._title.cget("text")))
+        report.check("the window offers \"back to random\" without anything clicked",
+                     pump_until(lambda: bool(screen._clear_button.winfo_manager()), 5))
+        screen._clear_playlist()
+        report.check("and that button puts the player back in the library",
+                     wait_for(lambda: library_track(engine.snapshot()), 45) is not None,
+                     str(engine.snapshot().get("current")))
+        report.check("the button is gone once the drop playlist is cleared",
+                     pump_until(lambda: not screen._clear_button.winfo_manager(), 5))
+    finally:
+        if screen is not None:
+            screen.destroy()
+        engine.stop()
+
+
+def _xdnd_drop_on_window(report: Reporter, root: Any, engine: Any, x11: Any, ctypes: Any,
+                         event_class: Any, tracks: dict) -> None:
+    """Drag *tracks* onto *root* with the XDND protocol and check what arrives.
+
+    Split out of :func:`test_drop_protocol` because everything here needs the
+    ctypes structures and the X connection that the caller set up.
+    """
+    display = x11.XOpenDisplay(None)
+    atoms = {name: x11.XInternAtom(ctypes.c_void_p(display), name.encode(), False)
+             for name in ("XdndSelection", "XdndEnter", "XdndPosition", "XdndDrop",
+                          "XdndActionCopy", "text/uri-list")}
+    root_window = x11.XDefaultRootWindow(ctypes.c_void_p(display))
+    source_window = x11.XCreateSimpleWindow(ctypes.c_void_p(display),
+                                            ctypes.c_ulong(root_window), 0, 0, 1, 1, 0, 0, 0)
+    x11.XSetSelectionOwner(ctypes.c_void_p(display), ctypes.c_ulong(atoms["XdndSelection"]),
+                           ctypes.c_ulong(source_window), 0)
+    x11.XFlush(ctypes.c_void_p(display))
+    uri = tracks["loose"].as_uri() + "\r\n" + tracks["first"].as_uri() + "\r\n"
+    stopped = threading.Event()
+    answers = {"asked": 0}
+
+    def serve_requests() -> None:
+        """Answer the data request, the way the file manager does."""
+        event = event_class()
+        while not stopped.is_set():
+            if not x11.XPending(ctypes.c_void_p(display)):
+                time.sleep(0.02)
+                continue
+            x11.XNextEvent(ctypes.c_void_p(display), ctypes.byref(event))
+            if event.type != 30:                        # SelectionRequest
+                continue
+            request = event.xselectionrequest
+            payload = uri.encode()
+            buffer = ctypes.create_string_buffer(payload)
+            property_atom = request.property or request.target
+            x11.XChangeProperty(ctypes.c_void_p(display), ctypes.c_ulong(request.requestor),
+                                ctypes.c_ulong(property_atom), ctypes.c_ulong(request.target),
+                                8, 0, buffer, len(payload))
+            notify = event_class()
+            notify.xselectionrequest.type = 31          # SelectionNotify
+            notify.xselectionrequest.send_event = True
+            notify.xselectionrequest.display = ctypes.c_void_p(display)
+            notify.xselectionrequest.requestor = request.requestor
+            notify.xselectionrequest.selection = request.selection
+            notify.xselectionrequest.target = request.target
+            notify.xselectionrequest.property = property_atom
+            notify.xselectionrequest.time = request.time
+            x11.XSendEvent(ctypes.c_void_p(display), ctypes.c_ulong(request.requestor),
+                           False, 0, ctypes.byref(notify))
+            x11.XFlush(ctypes.c_void_p(display))
+            answers["asked"] += 1
+
+    threading.Thread(target=serve_requests, daemon=True).start()
+
+    def send(message: str, window: int, values: list) -> None:
+        event = event_class()
+        event.xclient.type = 33                         # ClientMessage
+        event.xclient.send_event = True
+        event.xclient.display = ctypes.c_void_p(display)
+        event.xclient.window = window
+        event.xclient.message_type = atoms[message]
+        event.xclient.format = 32
+        for index, value in enumerate(values):
+            event.xclient.data[index] = ctypes.c_long(value)
+        x11.XSendEvent(ctypes.c_void_p(display), ctypes.c_ulong(window), False, 0,
+                       ctypes.byref(event))
+        x11.XFlush(ctypes.c_void_p(display))
+
+    def parent_of(win: int) -> int:
+        root_w = ctypes.c_ulong()
+        parent_w = ctypes.c_ulong()
+        kids = ctypes.POINTER(ctypes.c_ulong)()
+        count = ctypes.c_uint()
+        x11.XQueryTree(ctypes.c_void_p(display), ctypes.c_ulong(win), ctypes.byref(root_w),
+                       ctypes.byref(parent_w), ctypes.byref(kids), ctypes.byref(count))
+        if kids:
+            x11.XFree(kids)
+        return parent_w.value
+
+    # A drag source looks for the window the window manager created around the
+    # player (tkdnd marks that one as XDND-aware); without a WM it is the window
+    # itself.
+    def pump(seconds: float) -> None:
+        """The messages arrive on Tk's own connection: its loop must run."""
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            root.update()
+            time.sleep(0.02)
+
+    def pump_until(predicate: Any, timeout: float) -> bool:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            root.update()
+            if predicate():
+                return True
+            time.sleep(0.02)
+        return False
+
+    client_window = root.winfo_id()
+    target_window = parent_of(client_window) or client_window
+    position = ((root.winfo_rootx() + 200) << 16) | (root.winfo_rooty() + 200)
+    pump(0.4)                           # let the selection ownership settle
+    send("XdndEnter", target_window, [source_window, 5 << 24, atoms["text/uri-list"], 0, 0])
+    pump(0.4)
+    send("XdndPosition", target_window,
+         [source_window, 0, position, 0, atoms["XdndActionCopy"]])
+    pump(0.4)
+    send("XdndDrop", target_window, [source_window, 0, 0, 0, 0])
+    try:
+        report.check("the window accepts a drop from the file manager (XDND)",
+                     pump_until(lambda: bool(engine.drop_calls), 15),
+                     f"{answers['asked']} data request(s) answered")
+        report.check("the dropped files arrive as the paths that were dragged",
+                     engine.drop_calls[-1:] == [("play", [str(tracks["loose"]),
+                                                          str(tracks["first"])])],
+                     str(engine.drop_calls))
+    finally:
+        stopped.set()
+
+
+def test_drop_protocol(report: Reporter) -> None:
+    """A real XDND drop: the protocol exchange a file manager performs.
+
+    Is the window registered correctly *and* is the data read the way tkdnd
+    hands it over? That can only be shown by playing the other side: this test
+    opens its own X connection, owns the drag selection like Dolphin does, sends
+    enter/position/drop to the player window and answers the data request with a
+    ``text/uri-list``. The window must then hand exactly those two files to the
+    engine.
+    """
+    try:
+        import ctypes
+        import tkinter as tk
+
+        import ui
+    except ImportError as exc:
+        report.check(f"tkinter is importable ({exc})", False)
+        return
+    try:
+        x11 = ctypes.CDLL("libX11.so.6")
+        root = tk.Tk()
+    except (OSError, tk.TclError) as exc:
+        print(f"  [skip] no X11 session for the protocol check ({exc})", flush=True)
+        return
+
+    class ClientMessage(ctypes.Structure):
+        _fields_ = [("type", ctypes.c_int), ("serial", ctypes.c_ulong),
+                    ("send_event", ctypes.c_int), ("display", ctypes.c_void_p),
+                    ("window", ctypes.c_ulong), ("message_type", ctypes.c_ulong),
+                    ("format", ctypes.c_int), ("data", ctypes.c_long * 5)]
+
+    class SelectionRequest(ctypes.Structure):
+        _fields_ = [("type", ctypes.c_int), ("serial", ctypes.c_ulong),
+                    ("send_event", ctypes.c_int), ("display", ctypes.c_void_p),
+                    ("owner", ctypes.c_ulong), ("requestor", ctypes.c_ulong),
+                    ("selection", ctypes.c_ulong), ("target", ctypes.c_ulong),
+                    ("property", ctypes.c_ulong), ("time", ctypes.c_ulong)]
+
+    class Event(ctypes.Union):
+        _fields_ = [("type", ctypes.c_int), ("xclient", ClientMessage),
+                    ("xselectionrequest", SelectionRequest), ("pad", ctypes.c_long * 24)]
+
+    x11.XOpenDisplay.restype = ctypes.c_void_p
+    x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    x11.XInternAtom.restype = ctypes.c_ulong
+    x11.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+    x11.XDefaultRootWindow.restype = ctypes.c_ulong
+    x11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+
+    engine = _StubEngine()
+    screen = None
+    try:
+        build_local_fixtures()
+        root.geometry("1280x800")
+        screen = ui.PlayerScreen(root, engine=engine,
+                                 client=JellyfinClient("http://127.0.0.1:1"),
+                                 family=ui.pick_font_family(),
+                                 on_change_account=_noop, on_quit=_noop)
+        screen.pack(fill="both", expand=True)
+        deadline = time.time() + 0.8
+        while time.time() < deadline:
+            root.update()
+            time.sleep(0.02)
+        if screen._dnd_version is None:
+            print(f"  [skip] {dnd.INSTALL_HINT}", flush=True)
+            return
+        _xdnd_drop_on_window(report, root, engine, x11, ctypes, Event, LOCAL_TRACKS)
+    finally:
+        if screen is not None:
+            screen.destroy()
+        root.destroy()
+
+
 def main() -> int:
     report = Reporter()
     server, port = start_server()
@@ -1327,6 +2175,11 @@ def main() -> int:
         test_preloader(report, client)
         print("\nPlayback engine (silent, volume 0)")
         engine = test_engine(report, client)
+        print("\nDropped files, folders and playlists")
+        test_local_media(report)
+        test_drop_parsing(report)
+        print("\nA dropped playlist in the player")
+        test_dropped_playlist(report, client)
         print("\nStyle catalog and style filter")
         test_style_filter(report, client, test_catalog(report, build_fake_catalog(_TMP / "fake-catalog.sqlite")))
         print("\nUser interface")
@@ -1334,6 +2187,11 @@ def main() -> int:
         print("\nOverlays (help card, style picker)")
         test_overlays(report)
         test_style_panel(report)
+        print("\nDropping files on the window")
+        test_drop_ui(report)
+        test_drop_protocol(report)
+        print("\nA drop through the real window")
+        test_drop_end_to_end(report, client)
         print("\nRemembering the style filter")
         test_style_config(report)
         print("\nLauncher and application icon")

@@ -12,6 +12,23 @@
 # already installed on this machine (python-pillow 12.3.0).
 Pillow>=10.0.0
 
+# Optional, and only for two extras - the player itself runs without them:
+#
+#   tkinterdnd2  drops from the file manager (Dolphin, Nautilus, Thunar). It
+#                ships the tkdnd Tcl extension, which is what Tk needs to accept
+#                a dropped file at all. Without it the window simply has no drop
+#                target (--debug says so on start).
+#                    pip install --user --break-system-packages tkinterdnd2
+#                The AUR package works too, in which case the player finds it on
+#                its own:  yay -S tkdnd
+#
+#   mutagen      reads the title/artist/album tags, the track number, the
+#                duration and the embedded cover art of a dropped file. It is
+#                already installed on this machine (python-mutagen 1.48.1).
+#                Without it a dropped file is named after its file and folder
+#                names, and only cover art next to it is used.
+#                    pacman -S python-mutagen      (or: pip install mutagen)
+
 # System packages used at runtime:
 #   mpv        - audio playback backend + JSON IPC control
 #   python     - tkinter must be available (part of the default Python install)
