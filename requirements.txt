@@ -29,6 +29,19 @@ Pillow>=10.0.0
 #                names, and only cover art next to it is used.
 #                    pacman -S python-mutagen      (or: pip install mutagen)
 
+# The Discord Rich Presence needs no package at all: it is spoken to the Discord
+# desktop client over the local socket it creates (discord-ipc-0) with the
+# standard library alone - no discord-rpc, no bot token, no Discord account. It
+# stays quiet while Discord is not running.
+#
+#   --discord-cover is the only part that uses the network: it uploads a
+#   downscaled copy of the album art to an anonymous image host
+#   (litterbox.catbox.moe, deleted after 72 hours, catbox.moe as a fallback) so
+#   Discord has a URL it can fetch. Opt-in, urllib only, no tunnel and no
+#   cloudflared needed. Nothing else about the presence leaves the machine.
+
 # System packages used at runtime:
 #   mpv        - audio playback backend + JSON IPC control
 #   python     - tkinter must be available (part of the default Python install)
+#   Discord    - only for the Rich Presence (the desktop client, installed as a
+#                package or a Flatpak/Snap, always optional)

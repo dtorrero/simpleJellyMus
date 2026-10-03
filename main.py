@@ -7,6 +7,8 @@ Usage:
     python3 main.py --windowed      start windowed (the default)
     python3 main.py --login         force the login screen
     python3 main.py --reset-login   forget the saved login and exit
+    python3 main.py --no-discord    publish nothing to Discord (on by default)
+    python3 main.py --discord-cover also show the album art in Discord
     python3 main.py --debug         verbose Jellyfin/mpv logging
 
 Keys: Space play/pause · N/→ next · P/← previous · ↑/↓ volume · ,/. seek ·
@@ -39,6 +41,9 @@ from player import PlayerEngine, PlayerError
 from ui import (BACKGROUND, CARD, CARD_LIGHT, DANGER, MUTED, TEXT, WINDOW_SIZE, LoginFrame,
                 PlayerScreen, pick_font_family)
 import catalog as catalog_module
+import discord_cover
+import localmedia
+import presence
 
 GEOMETRY_RE = re.compile(r"^(\d{3,5})x(\d{3,5})$")
 MIN_WINDOW_SIZE = (900, 620)
@@ -71,6 +76,10 @@ class Application:
         # survives a restart (G in the player shows and changes it).
         if not self.style_filter:
             self.style_filter, self.style_mode = saved_style_filter(self.config)
+        # Discord Rich Presence: what the config file says, overridden by the
+        # command line (--no-discord, --discord-cover, --discord-client-id).
+        self.discord = discord_settings(self.config, options)
+        self.presence: Optional[presence.DiscordPresence] = None
         self.client: Optional[JellyfinClient] = None
         self.engine: Optional[PlayerEngine] = None
         self.frame: Optional[tk.Widget] = None
@@ -311,6 +320,65 @@ class Application:
         except tk.TclError:
             pass
 
+    # ------------------------------------------------------------------ discord
+    def _start_presence(self, client: JellyfinClient) -> Optional[presence.DiscordPresence]:
+        """Create and start the Discord Rich Presence (``None`` when it is off).
+
+        A presence that cannot be set up is never an error: it is decoration,
+        and it must not keep the music from playing.
+        """
+        if not self.discord.get("enabled"):
+            return None
+        cover = None
+        if self.discord.get("cover"):
+            cover = discord_cover.CoverUploader(
+                host=str(self.discord.get("cover_host") or "litterbox"),
+                expiry=str(self.discord.get("cover_expiry") or "72h"),
+                debug=self.debug)
+        try:
+            instance = presence.DiscordPresence(
+                client_id=self.discord.get("client_id") or presence.DEFAULT_CLIENT_ID,
+                activity_type=int(self.discord.get("activity_type") or 0),
+                status_display_type=int(self.discord.get("status_display_type") or 0),
+                cover=cover,
+                cover_provider=(lambda item: self._cover_file(client, item)) if cover else None,
+                debug=self.debug)
+            instance.start()
+        except Exception as exc:
+            print(f"[discord] rich presence stays off: {exc}", flush=True)
+            return None
+        if self.debug:
+            print(f"[discord] publishing as {instance.client_id}"
+                  f"{' with cover art' if cover is not None else ''}"
+                  f" (type {instance.activity_type},"
+                  f" status {instance.status_display_type})", flush=True)
+        return instance
+
+    @staticmethod
+    def _cover_file(client: JellyfinClient, item: Dict[str, Any]) -> Optional[Path]:
+        """The local artwork file of *item* (``None`` while there is none).
+
+        Only ever reached for ``--discord-cover``, and only from the presence's
+        own thread: it is the very file the window uses, so the server is asked
+        for the artwork only when it has not been fetched yet anyway.
+        """
+        try:
+            if item.get("_local_path"):
+                return localmedia.cover_path(item)      # a dropped file: already here
+            return client.download_image(item)          # cached, or fetched once
+        except (JellyfinError, OSError, ValueError):
+            return None
+
+    def _stop_presence(self) -> None:
+        """Clear the Discord presence (never blocks for long, never raises)."""
+        instance, self.presence = self.presence, None
+        if instance is None:
+            return
+        try:
+            instance.stop()
+        except Exception as exc:
+            print(f"[discord] could not clear the presence: {exc}", flush=True)
+
     # ------------------------------------------------------------------- player
     def start_player(self, client: JellyfinClient) -> None:
         """Build the engine, spawn mpv and show the player screen."""
@@ -322,6 +390,11 @@ class Application:
                                        debug=self.debug, catalog=self.catalog,
                                        style_filter=self.style_filter,
                                        style_mode=self.style_mode)
+            # Discord is told about every track change through the same listener
+            # mechanism the window uses; it only ever stores the snapshot.
+            self.presence = self._start_presence(client)
+            if self.presence is not None:
+                self.engine.add_listener(self.presence.on_state)
             self.engine.start()
         except PlayerError as exc:
             messagebox.showerror("SimpleJellyMus", str(exc))
@@ -346,6 +419,7 @@ class Application:
     def change_account(self) -> None:
         """Stop playback and show the login screen again."""
         self._persist_window_state()
+        self._stop_presence()
         engine, self.engine = self.engine, None
         if engine is not None:
             # Free the mpv process and its socket without freezing the UI.
@@ -374,6 +448,7 @@ class Application:
                 setattr(self, job, None)
         self._persist_window_state()
         self._closing = True
+        self._stop_presence()
         if engine is not None:
             engine.stop()
         try:
@@ -400,6 +475,24 @@ def parse_args(argv):
                         help="how several styles combine: any (default), all, not")
     parser.add_argument("--catalog", default="", metavar="PATH",
                         help="style catalog database (default: the one styles/ built)")
+    parser.add_argument("--discord", action="store_true",
+                        help="show what is playing in Discord (the default; overrides a"
+                             " saved \"discord\": {\"enabled\": false})")
+    parser.add_argument("--no-discord", action="store_true",
+                        help="publish nothing to Discord")
+    parser.add_argument("--discord-cover", action="store_true",
+                        help="also show the album art in Discord (uploads a small copy"
+                             " of the cover to an anonymous image host so Discord can"
+                             " fetch it)")
+    parser.add_argument("--discord-client-id", default="", metavar="ID",
+                        help="publish under your own Discord application (default: the"
+                             " id jellyfin-rpc ships with)")
+    parser.add_argument("--discord-status-display", default="",
+                        choices=["", "name", "state", "details"],
+                        metavar="{name,state,details}",
+                        help="which field Discord shows as the status text in the"
+                             " member list: details (the song title, the default),"
+                             " state (artist and album) or name (the application)")
     return parser.parse_args(argv)
 
 
@@ -421,6 +514,31 @@ def install_signal_handlers(app: "Application") -> None:
             signal.signal(number, handler)
         except (ValueError, OSError):
             pass
+
+
+def discord_settings(config: Dict[str, Any], options) -> Dict[str, Any]:
+    """The Discord settings that apply: the config file first, then the flags.
+
+    Everything missing or damaged falls back to the default (Rich Presence on,
+    cover art off, "Listening to" the track title), so a stale config file never
+    keeps the music from starting.
+    """
+    settings = jellyfin.discord_config(config)
+    if getattr(options, "discord", False):
+        settings["enabled"] = True
+    if getattr(options, "no_discord", False):
+        settings["enabled"] = False
+    if getattr(options, "discord_cover", False):
+        # Artwork without the presence would upload for nothing.
+        settings["cover"] = True
+        settings["enabled"] = True
+    client_id = str(getattr(options, "discord_client_id", "") or "").strip()
+    if client_id:
+        settings["client_id"] = client_id
+    display = str(getattr(options, "discord_status_display", "") or "").strip().lower()
+    if display in jellyfin.STATUS_DISPLAY_NAMES:
+        settings["status_display_type"] = jellyfin.STATUS_DISPLAY_NAMES.index(display)
+    return settings
 
 
 def saved_style_filter(config: Dict[str, Any]) -> Tuple[List[str], str]:

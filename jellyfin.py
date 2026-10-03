@@ -114,6 +114,75 @@ def stored_device_id() -> str:
     return str(config.get("device_id") or "")
 
 
+# The ``discord`` block of the config file: Rich Presence is on by default, and
+# cover art (which uploads a small copy of the artwork to an anonymous image
+# host, see discord_cover.py) is not. The block lives here, next to the other
+# config helpers, so the player and the self-test read exactly the same values.
+#
+# Two of the values only shape how Discord words the presence: ``activity_type``
+# 2 is "Listening to ..." (and Discord draws the start/end timestamps as a time
+# bar instead of counting down), and ``status_display_type`` 2 makes the status
+# text - the one line others see in their member list - show the ``details``
+# field, the track title. Without it Discord falls back to the application name
+# ("Jellyfin RP"), which is the one thing a music player does not want there.
+# Both are wishes, not promises: a client that does not know them ignores them.
+DISCORD_DEFAULTS: Dict[str, Any] = {
+    "enabled": True,
+    "client_id": "",
+    "cover": False,
+    "cover_host": "litterbox",
+    "cover_expiry": "72h",
+    "activity_type": 2,
+    "status_display_type": 2,
+}
+DISCORD_HOSTS = ("litterbox", "catbox")
+# The fields Discord can put into the status text, by the name Discord uses for
+# them; the index in this tuple is the value of ``status_display_type``.
+STATUS_DISPLAY_NAMES = ("name", "state", "details")
+
+
+def discord_config(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """The ``discord`` block of the config file, always complete and sane.
+
+    Anything missing or damaged falls back to the default, so an older or a
+    hand-edited config file can never keep the music from starting.
+    """
+    values = dict(DISCORD_DEFAULTS)
+    stored = (config or {}).get("discord")
+    if not isinstance(stored, dict):
+        return values
+    if isinstance(stored.get("enabled"), bool):
+        values["enabled"] = stored["enabled"]
+    if isinstance(stored.get("cover"), bool):
+        values["cover"] = stored["cover"]
+    for key in ("client_id", "cover_expiry"):
+        if isinstance(stored.get(key), str) and stored[key].strip():
+            values[key] = stored[key].strip()
+    host = str(stored.get("cover_host") or "").strip().lower()
+    if host in DISCORD_HOSTS:
+        values["cover_host"] = host
+    try:
+        # A missing key keeps the configured default - only a stored value is
+        # used, and a damaged one falls back to the default too.
+        values["activity_type"] = max(0, min(5, int(
+            stored.get("activity_type", DISCORD_DEFAULTS["activity_type"]))))
+    except (TypeError, ValueError):
+        pass
+    # ``status_display_type`` is written as a number (0 name, 1 state, 2 details)
+    # but the words are accepted too, because they are what Discord itself calls
+    # these fields and much easier to hand-edit.
+    display = stored.get("status_display_type")
+    word = display.strip().lower() if isinstance(display, str) else ""
+    if word in STATUS_DISPLAY_NAMES:
+        values["status_display_type"] = STATUS_DISPLAY_NAMES.index(word)
+    elif not isinstance(display, bool) and display is not None:
+        try:
+            values["status_display_type"] = max(0, min(2, int(display)))
+        except (TypeError, ValueError):
+            pass
+    return values
+
+
 def audio_extension(item: Dict[str, Any]) -> str:
     """Best-effort file extension for a Jellyfin audio item."""
     container = str(item.get("Container") or "").split(",")[0].strip().lower()

@@ -11,6 +11,10 @@ ends, the "back to random" button, the Tcl list a file manager drops, and the
 XDND exchange itself (the test plays the file manager and drops two files on the
 window over the real X11 protocol).
 
+The Discord Rich Presence is checked against a fake Discord (the local IPC socket
+the real client creates) and a fake image host, so no Discord account and no
+network call are involved.
+
     python3 selftest.py
 
 Playback happens at volume 0 and every cache/config artefact goes to a
@@ -40,6 +44,8 @@ os.environ["XDG_CONFIG_HOME"] = str(_TMP / "config")
 import dnd  # noqa: E402  (imported once the environment is ready)
 import jellyfin  # noqa: E402
 import localmedia  # noqa: E402
+import discord_cover  # noqa: E402
+import presence  # noqa: E402
 from jellyfin import AuthError, JellyfinClient, JellyfinError  # noqa: E402
 from player import PlayerEngine, PlayQueue, Preloader  # noqa: E402
 
@@ -182,6 +188,171 @@ def start_server():
     server = ThreadingHTTPServer(("127.0.0.1", 0), FakeJellyfin)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server, server.server_address[1]
+
+
+class FakeImageHost(BaseHTTPRequestHandler):
+    """A stand-in for litterbox/catbox: answers an upload with a public URL.
+
+    The class attributes configure the next answer - a URL, an HTTP error, a
+    body that is not a URL at all, or a slow reply (which is how the test sees
+    that a track reaches Discord before its artwork does).
+    """
+
+    protocol_version = "HTTP/1.1"
+    server_version = "FakeImageHost/1.0"
+    answer = "https://litter.catbox.moe/selftest.png"
+    status = 200
+    delay = 0.0
+    requests = []
+
+    @classmethod
+    def reset(cls, answer=None, status: int = 200, delay: float = 0.0) -> None:
+        cls.answer = cls.answer if answer is None else str(answer)
+        cls.status = status
+        cls.delay = delay
+        cls.requests = []
+
+    def log_message(self, *args):  # keep the test output clean
+        pass
+
+    def do_POST(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length) if length else b""
+        if self.delay:
+            time.sleep(self.delay)
+        type(self).requests.append({"path": self.path, "body": body,
+                                    "content_type": self.headers.get("Content-Type") or ""})
+        if self.status != 200:
+            self.send_response(self.status)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        payload = type(self).answer.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+
+def start_image_host():
+    server = ThreadingHTTPServer(("127.0.0.1", 0), FakeImageHost)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, server.server_address[1]
+
+
+class FakeDiscord:
+    """A stand-in for the Discord client's local IPC socket.
+
+    Records every frame it is sent, answers the handshake the way Discord does,
+    pings each new connection (that is how the real client keeps the socket
+    alive) and replies to every frame - so the presence can be exercised end to
+    end without a real Discord running.
+    """
+
+    def __init__(self, path) -> None:
+        import socket as socket_module
+
+        self.path = Path(path)
+        self.frames = []
+        self.handshakes = []
+        self.pongs = []
+        self.connections = 0
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._server = socket_module.socket(socket_module.AF_UNIX, socket_module.SOCK_STREAM)
+        self._server.bind(str(self.path))
+        self._server.listen(4)
+        self._server.settimeout(0.2)
+        self._thread = threading.Thread(target=self._accept, name="fake-discord", daemon=True)
+        self._thread.start()
+
+    # ------------------------------------------------------------------ protocol
+    @staticmethod
+    def _send(connection, opcode: int, payload: dict) -> None:
+        data = json.dumps(payload).encode("utf-8")
+        try:
+            connection.sendall(struct.pack("<II", opcode, len(data)) + data)
+        except OSError:
+            pass
+
+    def _accept(self) -> None:
+        while not self._stop.is_set():
+            try:
+                connection, _ = self._server.accept()
+            except (TimeoutError, OSError):
+                continue
+            with self._lock:
+                self.connections += 1
+            threading.Thread(target=self._talk, args=(connection,), daemon=True).start()
+
+    def _talk(self, connection) -> None:
+        connection.settimeout(0.2)
+        while not self._stop.is_set():
+            try:
+                header = connection.recv(8)
+            except (TimeoutError, OSError):
+                continue
+            if len(header) < 8:
+                break
+            opcode, length = struct.unpack("<II", header)
+            body = b""
+            while len(body) < length:
+                block = connection.recv(length - len(body))
+                if not block:
+                    break
+                body += block
+            try:
+                payload = json.loads(body.decode("utf-8")) if body else None
+            except ValueError:
+                continue
+            if opcode == 0:                      # handshake
+                with self._lock:
+                    self.handshakes.append(payload)
+                self._send(connection, 1, {"cmd": "DISPATCH", "evt": "READY",
+                                           "data": {"v": 1}, "nonce": None})
+                self._send(connection, 3, {"nonce": "keepalive"})
+            elif opcode == 1:                    # a frame the client sent us
+                if isinstance(payload, dict):
+                    with self._lock:
+                        self.frames.append(payload)
+                    self._send(connection, 1, {"cmd": payload.get("cmd"), "evt": None,
+                                               "data": None, "nonce": payload.get("nonce")})
+            elif opcode == 4:                    # our ping, answered
+                with self._lock:
+                    self.pongs.append(payload)
+        try:
+            connection.close()
+        except OSError:
+            pass
+
+    # ------------------------------------------------------------------- reading
+    def all(self) -> list:
+        with self._lock:
+            return list(self.frames)
+
+    def activities(self) -> list:
+        """The activity of every SET_ACTIVITY frame (``None`` = cleared)."""
+        with self._lock:
+            return [(frame.get("args") or {}).get("activity") for frame in self.frames
+                    if frame.get("cmd") == "SET_ACTIVITY"]
+
+    def last(self):
+        activities = self.activities()
+        return activities[-1] if activities else None
+
+    def count(self) -> int:
+        with self._lock:
+            return len(self.frames)
+
+    def close(self) -> None:
+        self._stop.set()
+        try:
+            self._server.close()
+        except OSError:
+            pass
+        self._thread.join(1.0)
+        self.path.unlink(missing_ok=True)
 
 
 def wait_for(predicate, timeout: float, interval: float = 0.1):
@@ -1076,6 +1247,385 @@ def test_style_config(report: Reporter) -> None:
     report.check("the window settings are not lost by saving the filter",
                  stored.get("window_mode") in (None, "windowed", "fullscreen"))
 
+
+def test_discord_presence(report: Reporter, client: JellyfinClient) -> None:
+    """The Discord Rich Presence: settings, protocol, de-duplication, artwork.
+
+    A fake Discord (the local IPC socket the real client would create) and a fake
+    image host stand in for the two things outside this machine, so the whole
+    path is verified without a Discord account, a network call or an access token.
+    The last block runs a real playback engine with the presence wired to it, the
+    way main.py does it.
+    """
+    import main
+
+    defaults = jellyfin.discord_config({})
+    report.check("rich presence is on by default, cover art is not",
+                 defaults == {"enabled": True, "client_id": "", "cover": False,
+                              "cover_host": "litterbox", "cover_expiry": "72h",
+                              "activity_type": 2, "status_display_type": 2}, str(defaults))
+    report.check("... and it reads as music: \"Listening to <track title>\"",
+                 defaults["activity_type"] == 2
+                 and jellyfin.STATUS_DISPLAY_NAMES[defaults["status_display_type"]] == "details",
+                 f"type {defaults['activity_type']}, status {defaults['status_display_type']}")
+    report.check("the bundled client id is a real Discord id",
+                 presence.DEFAULT_CLIENT_ID.isdigit() and len(presence.DEFAULT_CLIENT_ID) >= 17,
+                 presence.DEFAULT_CLIENT_ID)
+    report.check("a missing or damaged discord block falls back to the defaults",
+                 jellyfin.discord_config(None) == defaults
+                 and jellyfin.discord_config({"discord": "nonsense"}) == defaults)
+    report.check("stored values win, nonsense ones are dropped",
+                 jellyfin.discord_config({"discord": {"enabled": False, "cover": True,
+                                                      "client_id": " 42 ", "cover_host": "somewhere",
+                                                      "activity_type": "loud",
+                                                      "status_display_type": "loud"}})
+                 == {"enabled": False, "cover": True, "client_id": "42",
+                     "cover_host": "litterbox", "cover_expiry": "72h",
+                     "activity_type": 2, "status_display_type": 2})
+    report.check("a discord block that sets nothing else keeps both wording defaults",
+                 jellyfin.discord_config({"discord": {"enabled": True}})
+                 == {"enabled": True, "client_id": "", "cover": False,
+                     "cover_host": "litterbox", "cover_expiry": "72h",
+                     "activity_type": 2, "status_display_type": 2},
+                 str(jellyfin.discord_config({"discord": {"enabled": True}})))
+    report.check("the status text field can be spelled the way Discord spells it",
+                 jellyfin.discord_config({"discord": {"status_display_type": "name"}})
+                 ["status_display_type"] == 0
+                 and jellyfin.discord_config({"discord": {"status_display_type": " State "}})
+                 ["status_display_type"] == 1
+                 and jellyfin.discord_config({"discord": {"status_display_type": "details"}})
+                 ["status_display_type"] == 2)
+    report.check("a number outside 0-2 is clamped, true/false is ignored",
+                 jellyfin.discord_config({"discord": {"status_display_type": 9}})
+                 ["status_display_type"] == 2
+                 and jellyfin.discord_config({"discord": {"status_display_type": -3}})
+                 ["status_display_type"] == 0
+                 and jellyfin.discord_config({"discord": {"status_display_type": True}})
+                 ["status_display_type"] == 2)
+    stored = dict(jellyfin.load_config() or {})
+    stored["discord"] = {"enabled": True, "cover": True, "client_id": "123456789"}
+    jellyfin.save_config(stored)
+    written = jellyfin.discord_config(jellyfin.load_config())
+    report.check("a saved discord block survives a config round trip",
+                 written["cover"] is True and written["client_id"] == "123456789", str(written))
+
+    options = main.parse_args(["--discord-cover", "--discord-client-id", "99"])
+    settings = main.discord_settings({"discord": {"enabled": False}}, options)
+    report.check("--discord-cover switches the artwork on, and the presence with it",
+                 settings["cover"] is True and settings["enabled"] is True, str(settings))
+    report.check("--discord-client-id wins over the config file",
+                 settings["client_id"] == "99", settings["client_id"])
+    report.check("--no-discord switches it off again",
+                 main.discord_settings({"discord": {"enabled": True}},
+                                       main.parse_args(["--no-discord"]))["enabled"] is False)
+    report.check("--discord-status-display picks the field the member list shows",
+                 main.discord_settings({}, main.parse_args(
+                     ["--discord-status-display", "state"]))["status_display_type"] == 1
+                 and main.discord_settings({}, main.parse_args(
+                     ["--discord-status-display", "name"]))["status_display_type"] == 0
+                 and main.discord_settings({}, main.parse_args([]))["status_display_type"] == 2)
+
+    def snapshot(track: int = 1, *, position: float = 0.0, duration: float = 240.0,
+                 paused: bool = False, name: str = "") -> dict:
+        """An engine snapshot, exactly as PlayerEngine.snapshot() builds one."""
+        item = {"Id": f"a{track}", "Name": name or f"Test Song {track}", "Type": "Audio",
+                "Album": "Test Album", "AlbumId": "album-1", "AlbumPrimaryImageTag": "tag-1",
+                "Artists": [f"Artist {track % 2}"], "ProductionYear": 2024,
+                "RunTimeTicks": int(duration * 10_000_000)}
+        return {"current": item, "up_next": None, "position": position, "duration": duration,
+                "paused": paused, "volume": 0, "status": "Playing", "error": "",
+                "preload_ready": True, "server": "http://127.0.0.1:1234", "user": "tester",
+                "filter": {"entries": [], "mode": "any"},
+                "local": {"active": False, "remaining": 0, "total": 0}}
+
+    payload = presence.activity_payload(snapshot(1))
+    report.check("nothing is published for an idle player",
+                 presence.activity_payload({"current": None}) is None
+                 and presence.activity_payload({"current": {}}) is None)
+    report.check("only the two text lines, the time and the images are sent",
+                 set(payload) == {"details", "state", "timestamps", "assets"},
+                 str(sorted(payload)))
+    report.check("the track title is the details line", payload["details"] == "Test Song 1")
+    report.check("artist and album share the state line",
+                 payload["state"] == "Artist 1 — Test Album", payload["state"])
+    report.check("the timestamps span the whole track",
+                 payload["timestamps"]["end"] - payload["timestamps"]["start"] == 240,
+                 str(payload["timestamps"]))
+    report.check("the logo and the playing badge are the images",
+                 payload["assets"] == {"large_image": "logo", "large_text": "Test Album",
+                                       "small_image": "playing", "small_text": "Playing"},
+                 str(payload["assets"]))
+    report.check("no images are sent when no asset keys are configured",
+                 "assets" not in presence.activity_payload(snapshot(1), assets={}))
+    report.check("the two wording fields are left out while they are 0 (Discord's default)",
+                 "type" not in payload and "status_display_type" not in payload)
+    named = presence.activity_payload(snapshot(1), activity_type=2, status_display_type=2)
+    report.check("the frame asks Discord for \"Listening to <track title>\"",
+                 named["type"] == 2 and named["status_display_type"] == 2,
+                 f"type {named.get('type')}, status {named.get('status_display_type')}")
+    report.check("... and the field it names is the one holding the title",
+                 jellyfin.STATUS_DISPLAY_NAMES[named["status_display_type"]] == "details"
+                 and named["details"] == "Test Song 1"
+                 and jellyfin.STATUS_DISPLAY_NAMES[1] == "state"
+                 and named["state"] == "Artist 1 — Test Album")
+    report.check("an asset key that was never uploaded renders nothing",
+                 "large_image" not in presence.activity_payload(snapshot(2), assets={"logo": ""}))
+    report.check("a very long title is shortened, not cut off mid-word",
+                 len(presence.activity_payload(snapshot(1, name="word " * 200))["details"]) <= 128)
+    report.check("a track without a name still says something",
+                 presence.activity_payload({"current": {"Id": "x"}})["details"] == "Unknown title")
+    report.check("a track without a known duration has no timestamps",
+                 "timestamps" not in presence.activity_payload({"current": {"Id": "x", "Name": "y"},
+                                                                 "duration": 0}))
+    quiet = presence.activity_payload(snapshot(1, position=3.0, paused=True))
+    report.check("a paused track carries no timestamps at all", "timestamps" not in quiet)
+    report.check("... and shows the paused badge",
+                 (quiet.get("assets") or {})["small_image"] == "paused")
+
+    # A Discord that is not running is not an error -----------------------------
+    import socket as socket_module
+
+    runtime = _TMP / "discord"
+    runtime.mkdir(exist_ok=True)
+    report.check("without a Discord the socket lookup finds nothing",
+                 presence.find_discord_socket([runtime]) is None, str(runtime))
+
+    discord = FakeDiscord(runtime / "discord-ipc-0")
+    elsewhere = _TMP / "elsewhere"
+    elsewhere.mkdir(exist_ok=True)
+    stray = socket_module.socket(socket_module.AF_UNIX, socket_module.SOCK_STREAM)
+    stray.bind(str(elsewhere / "not-discord.sock"))
+    try:
+        report.check("the socket the Discord client creates is found",
+                     presence.find_discord_socket([runtime]) == str(discord.path),
+                     str(presence.find_discord_socket([runtime])))
+        report.check("a socket with a different name is ignored",
+                     presence.find_discord_socket([elsewhere]) is None)
+    finally:
+        stray.close()
+
+    silent = presence.DiscordPresence(client_id="", socket_path=str(discord.path))
+    silent.start()
+    silent.on_state(snapshot(1))
+    silent.stop()
+    report.check("a presence without a client id stays completely quiet",
+                 discord.count() == 0 and discord.handshakes == [])
+
+    def last_with_image(name: str):
+        last = discord.last() or {}
+        return last if (last.get("assets") or {}).get("small_image") == name else None
+
+    def last_with_details(title: str):
+        last = discord.last() or {}
+        return last if last.get("details") == title else None
+
+    instance = presence.DiscordPresence(client_id="424242", socket_path=str(discord.path),
+                                        activity_type=2, status_display_type=2,
+                                        interval=0.05, tolerance=5.0, rediscover=5.0)
+    instance.start()
+    report.check("the presence connects to Discord by itself",
+                 wait_for(lambda: list(discord.handshakes) or None, 4.0) is not None,
+                 f"{discord.connections} connection(s)")
+    report.check("it introduces itself with version 1 and the client id",
+                 discord.handshakes == [{"v": 1, "client_id": "424242"}],
+                 json.dumps(discord.handshakes))
+
+    instance.on_state(snapshot(1, position=0.0))
+    first = wait_for(lambda: discord.last() or None, 4.0)
+    first = first if isinstance(first, dict) else {}
+    report.check("the track that is playing is published", bool(first), json.dumps(first))
+    report.check("the track is the details line", first.get("details") == "Test Song 1")
+    report.check("artist and album are the state line",
+                 first.get("state") == "Artist 1 — Test Album", str(first.get("state")))
+    stamps = first.get("timestamps") or {}
+    report.check("Discord is told the elapsed and the remaining time",
+                 stamps.get("end", 0) - stamps.get("start", 0) == 240, str(stamps))
+    report.check("the logo and the playing badge are used",
+                 first.get("assets") == {"large_image": "logo", "large_text": "Test Album",
+                                         "small_image": "playing", "small_text": "Playing"},
+                 str(first.get("assets")))
+    report.check("the frame that reaches Discord carries both wording fields",
+                 first.get("type") == 2 and first.get("status_display_type") == 2,
+                 json.dumps({key: first.get(key) for key in ("type", "status_display_type")}))
+
+    before = discord.count()
+    for step in range(5):
+        instance.on_state(snapshot(1, position=1.0 + step * 0.5))
+    time.sleep(0.6)
+    report.check("plain progress is not sent again - Discord counts it itself",
+                 discord.count() == before, f"{discord.count() - before} extra frame(s)")
+
+    instance.on_state(snapshot(1, position=3.0, paused=True))
+    paused = wait_for(lambda: last_with_image("paused"), 4.0)
+    report.check("pausing switches the badge to paused", bool(paused))
+    report.check("a paused track is published without timestamps",
+                 bool(paused) and "timestamps" not in paused, json.dumps(paused))
+
+    instance.on_state(snapshot(1, position=3.0, paused=False))
+    report.check("resuming switches the badge back",
+                 wait_for(lambda: last_with_image("playing"), 4.0) is not None)
+
+    instance.on_state(snapshot(2))
+    changed = wait_for(lambda: last_with_details("Test Song 2"), 4.0)
+    report.check("a new track updates both lines",
+                 bool(changed) and changed.get("state") == "Artist 0 — Test Album",
+                 str((changed or {}).get("state")))
+
+    earlier = (changed or {}).get("timestamps") or {}
+    instance.on_state(snapshot(2, position=120.0))
+    seeked = wait_for(lambda: ((discord.last() or {}).get("timestamps") or {}) != earlier
+                      and discord.last(), 4.0)
+    report.check("a seek moves the timestamps with it",
+                 bool(seeked) and (seeked.get("timestamps") or {}).get("start", 0)
+                 <= earlier.get("start", 0) - 100, str((seeked or {}).get("timestamps")))
+
+    report.check("no frame ever carries the Jellyfin access token",
+                 not any("api_key" in json.dumps(frame) or TOKEN in json.dumps(frame)
+                         for frame in discord.all()))
+    report.check("every frame is a command with a matching nonce",
+                 all(frame.get("cmd") and frame.get("nonce") for frame in discord.all()))
+    report.check("a ping from Discord is answered with a pong",
+                 wait_for(lambda: list(discord.pongs) or None, 3.0) is not None,
+                 json.dumps(discord.pongs))
+
+    # Stopping the player clears it again ---------------------------------------
+    instance.stop()
+
+    def cleared() -> bool:
+        activities = discord.activities()
+        return bool(activities) and activities[-1] is None
+
+    report.check("stopping the player clears the presence in Discord",
+                 wait_for(lambda: cleared(), 3.0) is not None, json.dumps(discord.activities()[-1:]))
+    clears = [frame for frame in discord.all()
+              if frame.get("cmd") == "SET_ACTIVITY"
+              and (frame.get("args") or {}).get("activity") is None]
+    report.check("the clear is the same frame without an activity",
+                 len(clears) == 1 and (clears[0].get("args") or {}).get("pid") == os.getpid(),
+                 f"{len(clears)} clear frame(s)")
+
+    # Cover art: the album cover becomes a URL Discord can fetch ----------------
+    host, port = start_image_host()
+    try:
+        endpoint = f"http://127.0.0.1:{port}/upload"
+        cover_file = _TMP / "discord-cover.jpg"
+        cover_file.write_bytes(COVER_BYTES)
+        public = "https://litter.catbox.moe/selftest.png"
+        FakeImageHost.reset(public)
+        uploader = discord_cover.CoverUploader(endpoint=endpoint, cache_file=_TMP / "covers.json",
+                                               max_size=128, spacing=0.0)
+        report.check("the artwork is uploaded and its public URL comes back",
+                     uploader.url_for(cover_file) == public, str(uploader.url_for(cover_file)))
+        request = FakeImageHost.requests[0] if FakeImageHost.requests else {}
+        body = request.get("body") or b""
+        report.check("the upload is the multipart POST the host expects",
+                     request.get("content_type", "").startswith("multipart/form-data")
+                     and b'name="fileToUpload"' in body, str(request.get("path")))
+        report.check("litterbox is asked for a file that lives 72 hours",
+                     b'name="time"' in body and b"72h" in body)
+        report.check("only a downscaled copy leaves the machine",
+                     0 < len(body) < len(COVER_BYTES),
+                     f"{len(body)} of {len(COVER_BYTES)} bytes")
+        report.check("the same artwork is never uploaded twice",
+                     uploader.url_for(cover_file) == public and len(FakeImageHost.requests) == 1,
+                     f"{len(FakeImageHost.requests)} request(s)")
+        report.check("the URL is remembered for the next start",
+                     discord_cover.CoverUploader(endpoint=endpoint, cache_file=_TMP / "covers.json",
+                                                 spacing=0.0).url_for(cover_file) == public
+                     and len(FakeImageHost.requests) == 1)
+        report.check("a cover that is not a file is not uploaded",
+                     uploader.url_for(_TMP / "no-such-cover.jpg") is None
+                     and uploader.url_for(None) is None)
+
+        FakeImageHost.reset("<html>502 Bad Gateway</html>")
+        report.check("a host that answers rubbish leaves the artwork alone",
+                     discord_cover.CoverUploader(endpoint=endpoint, cache_file=_TMP / "broken.json",
+                                                 spacing=0.0).url_for(cover_file) is None)
+        FakeImageHost.reset("http://127.0.0.1/cover.png")
+        report.check("a URL Discord could not fetch is refused",
+                     discord_cover.CoverUploader(endpoint=endpoint, cache_file=_TMP / "private.json",
+                                                 spacing=0.0).url_for(cover_file) is None)
+
+        FakeImageHost.reset("https://litter.catbox.moe/art.png", delay=0.5)
+        art = discord_cover.CoverUploader(endpoint=endpoint, cache_file=_TMP / "art.json",
+                                          max_size=128, spacing=0.0)
+        painter = presence.DiscordPresence(client_id="424242", socket_path=str(discord.path),
+                                           cover=art, cover_provider=lambda item: cover_file,
+                                           interval=0.05)
+        painter.start()
+
+        def painted(title: str) -> list:
+            found = []
+            for frame in discord.all():
+                activity = (frame.get("args") or {}).get("activity") or {}
+                if activity.get("details") == title:
+                    found.append(activity)
+            return found
+
+        painter.on_state(snapshot(3))
+        report.check("the track reaches Discord before its artwork is ready",
+                     wait_for(lambda: painted("Test Song 3") or None, 4.0) is not None
+                     and (painted("Test Song 3")[0].get("assets") or {}).get("large_image")
+                     == "logo", str(painted("Test Song 3")[:1]))
+        report.check("the uploaded artwork replaces the logo",
+                     wait_for(lambda: any((activity.get("assets") or {}).get("large_image")
+                                          == "https://litter.catbox.moe/art.png"
+                                          for activity in painted("Test Song 3")) or None, 5.0)
+                     is not None)
+        report.check("the artwork is uploaded once, not once per update",
+                     len(FakeImageHost.requests) == 1, f"{len(FakeImageHost.requests)} request(s)")
+        painter.stop()
+        report.check("stopping the player clears the presence with the artwork too",
+                     wait_for(lambda: cleared(), 3.0) is not None)
+    finally:
+        host.shutdown()
+        host.server_close()
+    discord.close()
+
+    gone = presence.DiscordPresence(client_id="424242", socket_path=str(runtime / "discord-ipc-7"),
+                                    interval=0.05, rediscover=0.2)
+    gone.start()
+    gone.on_state(snapshot(1))
+    time.sleep(0.4)
+    gone.stop()
+    report.check("a Discord that is not there is not an error and not a crash",
+                 gone.connected is False and gone.frames == 0)
+
+    # The real thing: a playback engine with the presence wired to it -----------
+    wired_discord = FakeDiscord(runtime / "discord-ipc-1")
+    # Exactly the settings main.py hands over when nothing is configured.
+    wired_settings = main.discord_settings({}, main.parse_args([]))
+    wired = presence.DiscordPresence(client_id="424242", socket_path=str(wired_discord.path),
+                                     activity_type=wired_settings["activity_type"],
+                                     status_display_type=wired_settings["status_display_type"],
+                                     interval=0.05)
+    engine = None
+    try:
+        engine = PlayerEngine(client, volume=0, debug=False)
+        # Exactly what main.py does when the player screen is built.
+        engine.add_listener(wired.on_state)
+        wired.start()
+        engine.start()
+        report.check("a real engine drives the presence through one listener",
+                     wait_for(lambda: wired_discord.last() or None, 25.0) is not None,
+                     f"{wired_discord.count()} frame(s)")
+        playing = engine.snapshot().get("current") or {}
+        report.check("... with the track that is really playing",
+                     (wired_discord.last() or {}).get("details")
+                     == JellyfinClient.display_title(playing),
+                     str((wired_discord.last() or {}).get("details")))
+        live = wired_discord.last() or {}
+        report.check("... asked for as \"Listening to\" with the title in the status text",
+                     live.get("type") == 2 and live.get("status_display_type") == 2,
+                     json.dumps({key: live.get(key) for key in ("type", "status_display_type")}))
+        report.check("... and still nothing but the cover URL leaves the machine",
+                     not any("api_key" in json.dumps(frame) or TOKEN in json.dumps(frame)
+                             for frame in wired_discord.all()))
+    finally:
+        if engine is not None:
+            engine.stop()
+        wired.stop()
+        wired_discord.close()
 
 def test_launcher(report: Reporter) -> None:
     """The icon, the installer and the launcher must agree on one file and name.
@@ -2194,6 +2744,8 @@ def main() -> int:
         test_drop_end_to_end(report, client)
         print("\nRemembering the style filter")
         test_style_config(report)
+        print("\nDiscord Rich Presence")
+        test_discord_presence(report, client)
         print("\nLauncher and application icon")
         test_launcher(report)
         print("\nSingle instance")

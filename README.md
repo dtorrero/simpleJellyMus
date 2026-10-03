@@ -79,6 +79,9 @@ with the cover art on screen and no silence between tracks.
 * Starting the app a second time never gives you two players fighting over the
   speakers: it brings the running window to the front instead.
 * It can live in your application menu with its own icon (`./install.sh`).
+* What is playing can show up in your **Discord profile** ("Jellyfin - Test Song
+  1"), with no setup at all; `--no-discord` stops it, and uploading the album
+  cover for it is opt-in (`--discord-cover`).
 * Nothing in your library is ever modified. The player only reads from Jellyfin,
   and the style feature only reads a database file that it built on your machine.
 
@@ -93,6 +96,7 @@ with the cover art on screen and no silence between tracks.
 [Install / run](#install--run) ·
 [First run](#first-run) ·
 [Controls](#controls) ·
+[Discord Rich Presence](#discord-rich-presence) ·
 [How it works](#how-it-works) ·
 [File layout](#file-layout) ·
 [Self-test](#self-test-no-jellyfin-server-needed) ·
@@ -113,10 +117,15 @@ for the address and login the first time you start it (see
 | Pillow (`PIL`) for cover art | ✅ 12.3.0 |
 | `tkinterdnd2` (drops from the file manager) | ✅ 0.6.3 — optional |
 | `mutagen` (tags of a dropped file) | ✅ 1.48.1 — optional |
+| Discord desktop client (Rich Presence) | ✅ running — optional |
 
 Needing to install one of them? On this machine `sudo pacman -S mpv` and, on
 other distributions, `sudo apt install mpv python3-tk` or
 `sudo dnf install mpv python3-tkinter` are usually enough.
+
+Neither **Discord** nor anything else has to be installed for the player itself:
+the Rich Presence speaks to the Discord client over its local socket, and when
+Discord is not running it simply stays quiet (no error, no message).
 
 Everything else is Python's standard library (`urllib`, `json`, `socket`,
 `threading`, `tkinter`). The two optional entries above only add features - the
@@ -343,6 +352,126 @@ a mode you have to leave.
 Your files are only read: a drop is answered with *copy*, never *move*, so
 nothing is deleted or copied anywhere. Playlists are read, never written.
 
+## Discord Rich Presence
+
+While it plays, SimpleJellyMus can show the current song in your Discord profile:
+the title on the first line, artist and album on the second, a time bar, and the
+album cover as the big picture - and Discord words it **"Listening to <track
+title>"**, that title being the same line others read in their member list. It is
+**on by default** and needs no setup: the only requirement is that the Discord
+desktop client runs on the same machine, because the player talks to it over the
+local socket Discord creates (`discord-ipc-0`) - exactly like the official
+rich-presence libraries. There is no Discord login, no bot, no token, and nothing
+is sent over the network for it.
+
+```bash
+python3 main.py                 # presence on, with the app's own images
+python3 main.py --discord-cover # ... and the real album cover
+python3 main.py --no-discord    # publish nothing at all
+```
+
+| Flag | What it does |
+|---|---|
+| `--no-discord` | publish nothing (also beats `"discord": {"enabled": true}`) |
+| `--discord-cover` | also show the album art - see below |
+| `--discord-client-id ID` | publish under your own Discord application |
+| `--discord-status-display {name,state,details}` | which field the status text (the member list) shows - `details` (the track title) is the default |
+| `--discord` | switch it on again when the config file turns it off |
+
+### Where the name and the pictures come from
+
+Discord ties a presence to an *application*, and its **client id** decides which
+name and which images your profile shows. SimpleJellyMus ships the client id that
+[jellyfin-rpc](https://github.com/Radiicall/jellyfin-rpc) uses, so the profile
+reads **Jellyfin** and shows its logo - no account needed.
+
+If you would rather see your own name and your own images, register an
+application once (it is free and takes a minute; no bot, no invite needed):
+
+1. <https://discord.com/developers/applications> → **New Application**. The name
+   you give it is the name your profile will show.
+2. **Rich Presence → Art Assets**: upload your images and note their **key**
+   names. The keys the player looks for by default are `logo` (the big picture),
+   `playing` and `paused` (the small badge). A key that was never uploaded simply
+   renders nothing - it is not an error.
+3. **General Information → Application ID** is the client id. Pass it once, or
+   keep it in the config file:
+
+```bash
+python3 main.py --discord-client-id 1234567890123456789
+```
+
+```json
+{
+  "discord": { "client_id": "1234567890123456789" }
+}
+```
+
+> Those `logo`/`playing`/`paused` images can only come from the application
+> itself. Discord has no way of handing it a file at runtime - which is what the
+> next step is for.
+
+### Real album art (`--discord-cover`)
+
+Discord downloads a rich-presence picture from a URL, so the cover has to be
+reachable from the internet first. With `--discord-cover` the player uploads a
+**downscaled copy** (at most 512 px, JPEG) of the artwork it already has in
+`~/.cache/simplejellymus/covers/` to
+[litterbox.catbox.moe](https://litterbox.catbox.moe/) - a free, anonymous file
+host: no account, no name, nothing but the picture - and hands the resulting URL
+to Discord.
+
+* The upload **deletes itself after 72 hours**; while it exists, anyone who has
+  the URL could look at your album cover. That is why this is opt-in.
+* Every cover is uploaded **once per file**: the URL is remembered in
+  `~/.cache/simplejellymus/discord_covers.json` (mode `600`) and reused, also
+  after a restart. `{"discord": {"cover_host": "catbox"}}` keeps the file at
+  catbox.moe permanently instead, and `"cover_expiry"` changes the 72h lifetime.
+* The track reaches Discord **before** the upload has finished (with the static
+  `logo`); the artwork replaces it a moment later. A slow or broken host costs
+  the picture and nothing else, and it never touches playback: the upload happens
+  on the presence's own thread.
+* Your **access token never leaves the machine** - the only URL Discord ever sees
+  is the image host's.
+
+### What is published
+
+| In your profile | Where it comes from |
+|---|---|
+| the status text (the member list) | the track title - Discord's fallback there is the *application* name ("Jellyfin RP"), so the activity asks for the `details` field |
+| first line | the track title |
+| second line | `Artists — Album` |
+| the clock | `start`/`end` built from the position and the duration (nothing while paused); Discord draws them as a time bar, or as the usual elapsed/total clock while `activity_type` is `0` |
+| big picture | the uploaded cover, or the `logo` asset |
+| small badge | `playing` or `paused` |
+
+### "Listening to …" and the line in the member list
+
+Two small fields decide how Discord words all of the above. Both live in the
+`discord` block of the config file, and the defaults are the two values that make
+a music player read like one:
+
+| Setting | Default | What it changes |
+|---|---|---|
+| `activity_type` | `2` | the verb: `2` = **Listening to** `<title>` (with a time bar), `0` = **Playing** `<title>` |
+| `status_display_type` | `2` | the *status text* - the single line others read in their member list: `2` = the `details` field (**the track title**), `1` = `state` (artist and album), `0` = the `name` field, i.e. the Discord application |
+
+```json
+{ "discord": { "status_display_type": "state", "activity_type": 0 } }
+```
+
+The names work as well as the numbers (`name`/`state`/`details`), and
+`--discord-status-display state` does the same for one launch. A Discord client
+that predates these fields ignores them and keeps its usual rendering, and the
+application name stays on the profile card either way - that part is Discord's
+own and no setting can change it.
+
+A frame is only sent when something Discord shows actually changed: another
+track, a pause or resume, a seek of more than five seconds, another duration - at
+most one every two seconds, because Discord counts the elapsed time itself from
+the timestamps. Quitting clears the presence again, and `--debug` prints what the
+presence is doing in the terminal (lines starting with `[discord]`).
+
 ## How it works
 
 ```
@@ -419,8 +548,10 @@ Tkinter UI (ui.py) ──state snapshots── PlayerEngine (player.py)
 | `jellyfin.py` | Jellyfin client (login, random batches, stream/image URLs, downloads) + config storage |
 | `catalog.py` | read-only access to the local style catalog (styles, families, search, filtered random batches) |
 | `player.py` | mpv IPC client, preloader cache, random play queue, drop playlist, engine |
+| `presence.py` | Discord Rich Presence: the local Discord IPC socket, the activity and its worker thread |
 | `ui.py` | Tkinter login screen and fullscreen player UI (plus the `?` help and the style panel) |
 | `localmedia.py` | dropped files/folders/playlists → audio files and items (tags, cover art, playlists) |
+| `discord_cover.py` | uploads a downscaled cover to an anonymous image host so Discord can fetch it (opt-in, see below) |
 | `dnd.py` | drop target for the file manager (XDND via tkdnd/tkinterdnd2, optional) |
 | `selftest.py` | offline self-test: fake Jellyfin server + generated audio (see below) |
 | `styles/` | the standalone builder that produces `catalog.sqlite` (scan → link → vocabulary → normalize → optional LLM → report); it is never used while playing |
@@ -440,7 +571,10 @@ recalling the last choice), the catalog queries themselves, dropped files
 (folders, m3u/pls/xspf playlists, filtering, tags, cover art, playing a drop in
 order, the automatic return to random and the "back to random" button), the X11
 drop protocol itself (the test acts as the file manager and drags two files onto
-the window), and the single-instance guard - **over 250 checks**, all offline.
+the window), the single-instance guard, and the Discord Rich Presence (a fake
+Discord IPC socket and a fake image host: the handshake, what is sent, the
+de-duplication, the artwork upload with its cache, and what a failure does) -
+**over 340 checks**, all offline.
 
 ```bash
 python3 selftest.py            # ~1 minute, silent (volume 0)
@@ -457,9 +591,10 @@ tiny one.
 
 | Path | Content |
 |---|---|
-| `~/.config/simplejellymus/config.json` | server URL, username, access token, user id, device id, volume, window mode and size, and the style filter picked with `G` |
+| `~/.config/simplejellymus/config.json` | server URL, username, access token, user id, device id, volume, window mode and size, the style filter picked with `G`, and the `discord` block (on/off, client id, cover art, and how the presence is worded: `activity_type`, `status_display_type`) |
 | `~/.cache/simplejellymus/audio/` | preloaded (next) tracks, pruned automatically |
 | `~/.cache/simplejellymus/covers/` | album art cache |
+| `~/.cache/simplejellymus/discord_covers.json` | the URLs of the covers uploaded for the Discord presence (`--discord-cover`), one per cover file, mode `600` |
 | `~/.local/share/simplejellymus/catalog.sqlite` | the style dataset (only if you built it with `styles/`); opened read-only, the player never writes to it |
 | `$XDG_RUNTIME_DIR/simplejellymus.sock` | single-instance guard (removed when the app quits) |
 | `~/.local/share/applications/simplejellymus.desktop` | menu entry created by `install.sh` |
@@ -469,6 +604,10 @@ Delete the config file (or run `--reset-login`) to change accounts. Nothing in t
 repository itself ever holds your credentials — the token only lives in the config
 file above (mode `600`), and `.gitignore` additionally refuses to stage a stray
 `config.json`, `*.token` or `*.log`.
+
+The file is plain JSON, but the player writes it back after a resize, a volume
+change, a style selection or on exit — so **edit it while the player is closed**,
+or the running copy will overwrite your change with the values it read at start.
 
 To get rid of a style filter, press `G` in the player and use `Clear` →
 `Play these`; that clears the saved entry too. If a saved style has disappeared
@@ -494,6 +633,11 @@ simply plays random songs - a stale config never keeps the music from starting.
 | `--style` prints "matches no tracks" | that combination is empty (for example `all` of two unrelated styles): remove one of them, or switch to `any` |
 | Filtered playback repeats the same songs | the selection is small by nature; add another style or a family (the panel shows the count before you commit) |
 | Can't find a style in the panel | type part of the name - the search also looks at aliases (`outrun` finds *Synthwave*) and forgives typos |
+| Nothing shows up in Discord, and the terminal is quiet | Discord is not running: the presence looks for its socket every 15 seconds and starts on its own once it is; with `--debug` it says `[discord] no Discord IPC socket found` |
+| Discord's member list says "Jellyfin RP" instead of the song | that is the status text falling back to the application name: `"status_display_type": 2` is the default and asks for the track title (`0` would ask for the app name, `1` for artist and album) |
+| Discord says "Playing <song>" instead of "Listening to <song>" | the config file asks for it with `"activity_type": 0`; delete that key (or set it to `2`) for the music wording and the time bar |
+| Discord shows "Jellyfin" instead of your own name and images | that is the borrowed application id - pass `--discord-client-id` with your own application, see [Discord Rich Presence](#discord-rich-presence) |
+| Discord still shows the static logo instead of the cover | `--discord-cover` was not given, or litterbox.catbox.moe could not be reached; `--debug` prints `[discord] artwork published ...` or why it did not |
 
 ## Desktop app
 
