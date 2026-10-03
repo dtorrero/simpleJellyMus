@@ -22,21 +22,27 @@ into one SQLite database. The player only ever *reads* that database.
                                                         (fills what is missing AND
                                                          audits everything else)
                                    ▼
+              all of the above ──► propagation + consensus (step9):
+                                   the sources vote; agreement is kept,
+                                   a disagreement goes to out/review.csv
+                                   ▼
                        catalog.sqlite  ──► the player: pick or type a style,
                                            instant random playback
 ```
 
-Five layers, strongest first. A later layer never overwrites a stronger one for
+Seven layers, strongest first. A later layer never overwrites a stronger one for
 the same track+style, so the pipeline is safe to re-run at any time:
 
-| source   | rank | what it is |
-|----------|------|------------|
-| `human`  | 100  | your verdicts in `data/overrides.json` |
-| `tag`    |  80  | the genre tag, when it is already a canonical style name |
-| `rules`  |  70  | that same tag cleaned, split, translated (`data/styles.json`, `data/rules.json`) |
-| `audio`  |  60  | the acoustic classifier listening to the track |
-| `external`| 50 | Wikipedia / Wikidata / MusicBrainz |
-| `llm`    |  40  | DeepSeek's knowledge about the artist |
+| source       | rank | what it is |
+|--------------|------|------------|
+| `human`      | 100  | your verdicts in `data/overrides.json` |
+| `tag`        |  80  | the genre tag, when it is already a canonical style name |
+| `rules`      |  70  | that same tag cleaned, split, translated (`data/styles.json`, `data/rules.json`) |
+| `audio`      |  60  | the acoustic classifier listening to the track |
+| `consensus`  |  55  | step 9: several independent sources agreed (it can *promote* that agreement) |
+| `external`   |  50  | Wikipedia / Wikidata / MusicBrainz |
+| `llm`        |  40  | DeepSeek's knowledge about the artist |
+| `propagated` |  30  | step 9: inferred from the album/artist of the track |
 
 ## Run it
 
@@ -48,6 +54,7 @@ python3 step2_link.py --dry-run       # 2. check the Jellyfin path mapping
 python3 step2_link.py                 #    then link item ids            (~10 min on a Pi)
 python3 step3_vocabulary.py --all     # 3. vocabulary + coverage report
 python3 step4_normalize.py            # 4. raw tags -> canonical styles (seconds)
+python3 step9_consensus.py            # 9. propagate + vote over every source
 
 python3 step7_classify.py --setup     # 7a. models + venv (once, ~700 MB)
 python3 step7_classify.py --check     # 7b. is it wired correctly?
@@ -58,6 +65,7 @@ python3 step7_classify.py --audit     # 7f. where does the audio disagree?
 
 python3 step5_llm.py --estimate       # 5. DeepSeek: cost first, then --run
 
+python3 step9_consensus.py            # 9. re-vote now that audio/LLM answered
 python3 step8_report.py               # 8. health report + picker preview
 python3 styles_db.py                  # state of the dataset, any time
 ```
@@ -70,7 +78,7 @@ python3 styles_db.py                  # state of the dataset, any time
 > `artists.external_json` column, so it can be added later without any change to
 > the schema.
 
-`prepare_styles.sh` runs steps 1-4 and 8 in the right order.
+`prepare_styles.sh` runs steps 1-4, 9 and 8 in the right order.
 
 Every step is idempotent and resumable: re-running only does the work that is
 missing, and nothing is ever lost (`tracks.raw_genre` keeps the original tag
@@ -177,6 +185,53 @@ How it behaves:
 * **`--audit` never writes:** it compares the model's opinion with the
   tag-derived styles and writes `out/llm_disagreements.csv`, which is the
   shortest possible list of things worth a human look.
+
+## Propagation and consensus (step 9)
+
+The earlier steps each answer alone. Step 9 is the referee: it looks at the whole
+picture of a track, and it is completely offline and free.
+
+```bash
+python3 step9_consensus.py              # propagation + the vote + the reports
+python3 step9_consensus.py --propagate  # only fill the gaps
+python3 step9_consensus.py --dry-run    # write no style, just show the picture
+python3 step9_consensus.py --limit 500  # a quick look on a few hundred tracks
+```
+
+**Propagation** - what an artist (or an album) already is, its own tracks say.
+If nine of a band's ten tracks are "Death Metal", the tenth one is too. The
+label is written with `source='propagated'` (rank 30, the weakest there is), only
+on tracks that had no *specific* style, and only when at least
+`consensus.propagate_min_tracks` tracks (default 2) *and*
+`consensus.propagate_min_ratio` of the album/artist agree - a lone tag never
+spreads. A `Various Artists` compilation is treated more strictly: it is never
+pooled into the single `various artists` bucket (it is not one artist), and its
+own album only speaks when it is near-unanimous
+(`consensus.propagate_compilation_min_ratio`, default 0.9, over
+`consensus.propagate_compilation_min_tracks`, default 3) - so a punk sampler is
+not relabelled from one track. The winner is chosen deterministically (most
+votes, ties broken by style id), so every run gives the same answer. Measured
+here: 562 tracks filled, 562 labels.
+
+**Consensus** - the four *independent* voters of a track are asked to vote:
+`metadata` (your tag/rules - one voter, not two), `external`, `audio`, `llm`.
+Propagation is not a voter (it only echoes). Then:
+
+* unanimous specific voters, with at least `consensus.min_independent_sources`
+  (default 2) of them, get one `consensus` label. It ranks *below* the audio
+  classifier but *above* a lone automatic guess, so it can promote an agreement
+  (for example when the audio and the LLM both say "Melodic Death Metal" and the
+  tag only said "Metal") - it never overwrites real evidence.
+* any real disagreement is **never written**. The track goes to
+  `out/review.csv`, most useful first: `disputed` (your own tag says one family
+  and the automatic layers heard another - the tag is the suspect), `conflict`
+  (the sources split across families), `mismatch` (same family, different style)
+  and low-confidence agreements. `out/consensus_report.txt` summarises the run.
+
+On the current dataset (tags + rules + LLM only, no audio/external yet) the vote
+finds 39 conflicts and 3 mismatches out of 41 139 tracks - the short, honest list
+worth a human look. Once step 6/7 add their evidence, `step9_consensus.py` is the
+step that turns an agreement among them into labels.
 
 ## Editing the vocabulary
 

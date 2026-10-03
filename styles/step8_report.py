@@ -227,6 +227,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         for row in coverage_by_source(connection):
             add(f"- {str(row['label_source']):12s} {S.human(row['tracks'])} tracks")
         add()
+        add("## confidence & consensus")
+        add()
+        add(f"- tracks with a consensus label : {S.human(stats.get('tracks_with_consensus', 0))}"
+            "  (several independent sources agreed)")
+        add(f"- tracks filled by propagation : {S.human(stats.get('tracks_with_propagated', 0))}"
+            "  (album/artist context)")
+        add(f"- tracks under 0.6 confidence  : {S.human(stats.get('tracks_low_confidence', 0))}")
+        review_path = out / "review.csv"
+        if review_path.exists():
+            review_rows = max(0, len(review_path.read_text(encoding="utf-8").splitlines()) - 1)
+            add(f"- tracks to review (step9)      : {S.human(review_rows)}"
+                f"  -> {review_path.name}  (source conflicts & low confidence)")
+        else:
+            add("- tracks to review (step9)      : run step9_consensus.py to build review.csv")
+        add()
         add("## vocabulary")
         add()
         add(f"- {S.human(stats['styles'])} styles, {S.human(stats['styles_used'])} in use,"

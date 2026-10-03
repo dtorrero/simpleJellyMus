@@ -43,11 +43,15 @@ SCHEMA_VERSION = 2
 # Sources are ranked: the higher number wins when two layers disagree about the
 # same (track, style) pair. A human override always wins; the raw file tag beats
 # everything automatic because it is what the owner of the library wrote down.
+# ``consensus`` (step9) sits below the audio classifier and above the single
+# automatic guesses: it is only ever written when several *independent* sources
+# agreed, so it may promote such an agreement but never a lone guess.
 SOURCE_PRIORITY = {
     "human": 100,        # data/overrides.json
     "tag": 80,           # the genre embedded in the file itself
     "rules": 70,         # that tag, cleaned/split/mapped by data/rules.json
     "audio": 60,         # the acoustic classifier (independent evidence)
+    "consensus": 55,     # step9: what several independent sources agreed on
     "external": 50,      # Wikipedia / Wikidata / MusicBrainz
     "llm": 40,           # DeepSeek artist-level guess
     "propagated": 30,    # inferred from the artist/album roll-up
@@ -672,6 +676,13 @@ def dataset_stats(connection: sqlite3.Connection) -> Dict[str, Any]:
         "families": one("SELECT COUNT(DISTINCT family) FROM styles WHERE family IS NOT NULL"),
         "llm_cost": one("SELECT COALESCE(SUM(cost_usd), 0) FROM api_calls"),
         "llm_calls": one("SELECT COUNT(*) FROM api_calls"),
+        "tracks_with_consensus": one(
+            "SELECT COUNT(*) FROM tracks WHERE label_source = 'consensus'"),
+        "tracks_with_propagated": one(
+            "SELECT COUNT(*) FROM tracks WHERE label_source = 'propagated'"),
+        "tracks_low_confidence": one(
+            "SELECT COUNT(*) FROM tracks WHERE confidence IS NOT NULL AND confidence < 0.6"),
+        "consensus_review": int(meta_get(connection, "consensus_review", 0) or 0),
     }
     stats["tracks_without_style_pct"] = round(
         100.0 * stats["tracks_unlabelled"] / max(1, tracks_total), 1)
@@ -766,6 +777,10 @@ def print_status(connection: sqlite3.Connection) -> None:
     if stats["llm_calls"]:
         log(f"LLM calls         {human(stats['llm_calls'])}"
             f"  (cost {stats['llm_cost']:.4f} USD)")
+    if stats.get("tracks_with_consensus") or stats.get("tracks_with_propagated"):
+        log(f"consensus / prop. {human(stats['tracks_with_consensus'])}"
+            f" / {human(stats['tracks_with_propagated'])}"
+            f"  (to review: {human(stats.get('consensus_review', 0))})")
     rows = styles_by_source(connection)
     if rows:
         log("labels by source: " + ", ".join(
