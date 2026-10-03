@@ -24,6 +24,10 @@ Models (Essentia / MTG-UPF, CC-BY-NC-SA, downloaded into ``models/``):
     discogs-effnet-bs64-1.pb                 18 MB   audio -> embeddings (discogs-effnet tier)
     genre_discogs400-discogs-effnet-1.pb    2.1 MB   400 Discogs styles
     discogs-maest-30s-pw-2.pb               347 MB   accurate tier (optional)
+
+The genre head has a single usable output (``PartitionedCall:0``) which already
+returns the sigmoid probabilities - the worker only applies a sigmoid when the
+values really are raw logits, so the stored numbers are always comparable.
 """
 
 from __future__ import annotations
@@ -198,6 +202,21 @@ def load_labels(path):
     raise RuntimeError("no labels in the model json")
 
 
+def to_probabilities(values):
+    """Return probabilities, never raw logits.
+
+    Measured on this library (Discogs-EffNet + ``genre_discogs400``): the only
+    reachable head output, ``PartitionedCall:0``, *already* holds the sigmoid
+    probabilities (clear Death Metal tracks score 0.5-0.75 on the right label),
+    so applying a sigmoid again would flatten everything to ~0.5. The guard is
+    here for other head/tier/model versions that do expose logits: it only
+    rescales when a value is outside [0, 1].
+    """
+    if values.size and (float(values.min()) < 0.0 or float(values.max()) > 1.0):
+        return 1.0 / (1.0 + np.exp(-values))
+    return values
+
+
 def build(models, tier):
     if tier == "effnet":
         extractor = es.TensorflowPredictEffnetDiscogs(graphFilename=models["extractor"],
@@ -235,7 +254,8 @@ def main():
             try:
                 embeddings = extractor(decode(path, seconds, rate))
                 predictions = np.asarray(head(embeddings))
-                scores = predictions.mean(axis=0) if predictions.ndim > 1 else predictions
+                scores = to_probabilities(predictions.mean(axis=0)
+                                          if predictions.ndim > 1 else predictions)
                 order = np.argsort(scores)[::-1]
                 record = {
                     "path": path,
