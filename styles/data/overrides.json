@@ -11,6 +11,12 @@
     "         \"Withered Throne\": { \"styles\": [\"Melodic Death Metal\"], \"note\": \"tag says only 'Metal'\" }",
     "       }",
     "",
+    "  1b. Lock that verdict so every automatic label is removed and only your",
+    "      styles remain (use this when a tag or the LLM got the artist wrong):",
+    "       \"artists\": {",
+    "         \"Kadjo\": { \"styles\": [\"Deathcore\", \"Metalcore\"], \"exclusive\": true }",
+    "       }",
+    "",
     "  2. Force the styles of one album (keyed by 'artist :: album'):",
     "       \"albums\": {",
     "         \"Kamelot :: The Awakening\": { \"styles\": [\"Power Metal\", \"Symphonic Metal\"] }",
@@ -29,7 +35,13 @@
     "after editing this file; it re-applies the overrides to the whole library."
   ],
 
-  "artists": {},
+  "artists": {
+    "Kadjo": {
+      "styles": ["Deathcore", "Metalcore"],
+      "exclusive": true,
+      "note": "Manual fix: the LLM guessed Hip Hop/Trap/Rap Metal; the band is Deathcore/Metalcore. The files carry no genre tag."
+    }
+  },
   "albums": {},
   "tracks": {}
 }

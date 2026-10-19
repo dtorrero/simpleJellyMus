@@ -281,56 +281,81 @@ def _resolve_names(normalizer: Normalizer, names: Iterable[str],
     return resolved
 
 
+def _lock_artist(connection, key: str, style_ids: Sequence[str]) -> None:
+    """Make the artist roll-up agree with an exclusive artist override."""
+    row = connection.execute("SELECT family FROM styles WHERE id=? LIMIT 1",
+                             (style_ids[0],)).fetchone()
+    connection.execute(
+        "UPDATE artists SET styles=?, family=?, label_source='human', confidence=1.0,"
+        " updated_at=? WHERE key=?",
+        (json.dumps(list(style_ids)), row["family"] if row else None, S.now(), key),
+    )
+
+
 def apply_overrides(normalizer: Normalizer, connection, config: Dict[str, Any],
                     *, dry_run: bool) -> Tuple[int, List[str]]:
-    """Write the human verdicts into the dataset (source ``human``)."""
+    """Write the human verdicts into the dataset (source ``human``).
+
+    An entry with ``"exclusive": true`` is a lock: every automatic label of the
+    matched tracks is removed, so only the styles listed in the override remain.
+    This runs after the rules layer, so a genre tag cannot add a label back.
+    """
     overrides = load_overrides(config)
     errors: List[str] = []
-    by_artist: Dict[str, List[str]] = {}
-    by_album: Dict[str, List[str]] = {}
-    by_track: Dict[str, List[str]] = {}
+    by_artist: Dict[str, Tuple[List[str], bool]] = {}
+    by_album: Dict[str, Tuple[List[str], bool]] = {}
+    by_track: Dict[str, Tuple[List[str], bool]] = {}
     for name, entry in (overrides.get("artists") or {}).items():
         styles = _resolve_names(normalizer, (entry or {}).get("styles") or [],
                                 errors, f"artists[{name!r}]")
-        by_artist[S.norm_key(name)] = styles
+        by_artist[S.norm_key(name)] = (styles, bool((entry or {}).get("exclusive")))
     for name, entry in (overrides.get("albums") or {}).items():
         styles = _resolve_names(normalizer, (entry or {}).get("styles") or [],
                                 errors, f"albums[{name!r}]")
-        by_album[S.norm_key(name)] = styles
+        by_album[S.norm_key(name)] = (styles, bool((entry or {}).get("exclusive")))
     for path, entry in (overrides.get("tracks") or {}).items():
         styles = _resolve_names(normalizer, (entry or {}).get("styles") or [],
                                 errors, f"tracks[{path!r}]")
-        by_track[str(path)] = styles
+        by_track[str(path)] = (styles, bool((entry or {}).get("exclusive")))
     if not (by_artist or by_album or by_track):
         return 0, errors
 
     touched: List[str] = []
-    plan: List[Tuple[str, List[str]]] = []
+    plan: List[Tuple[str, List[str], bool]] = []
     for row in connection.execute("SELECT rel_path, artist_key, album_key FROM tracks"):
-        styles = by_track.get(row["rel_path"])
-        if styles is None:
-            styles = by_album.get(row["album_key"] or "")
-        if styles is None:
-            styles = by_artist.get(row["artist_key"] or "")
-        if styles is None:
+        match = by_track.get(row["rel_path"])
+        if match is None:
+            match = by_album.get(row["album_key"] or "")
+        if match is None:
+            match = by_artist.get(row["artist_key"] or "")
+        if match is None:
             continue
+        styles, exclusive = match
         touched.append(row["rel_path"])
-        plan.append((row["rel_path"], styles))
+        plan.append((row["rel_path"], styles, exclusive))
     if dry_run:
         return len(touched), errors
 
-    # An empty style list in overrides.json means "no style at all": drop every
-    # label of that track, whatever layer produced it.
-    cleared = [track_id for track_id, styles in plan if not styles]
+    # An empty style list means "no style at all"; an exclusive override is a
+    # lock. Both drop every label of the track, whatever layer produced it.
+    cleared = [track_id for track_id, styles, exclusive in plan if exclusive or not styles]
     if cleared:
         S.clear_track_styles(connection, list(S.SOURCE_PRIORITY), cleared)
-    written = [pair for pair in plan if pair[1]]
+    written = [(track_id, styles) for track_id, styles, _exclusive in plan if styles]
     if written:
         S.clear_track_styles(connection, ["human"], [track_id for track_id, _ in written])
     for track_id, style_ids in written:
         entries = [(style_id, 1.0 if index == 0 else 0.7, "human", 1.0, "overrides.json")
                    for index, style_id in enumerate(style_ids)]
         S.add_track_styles(connection, track_id, entries)
+
+    # The artist row is a cache/roll-up; make it reflect an exclusive verdict.
+    locks = [(key, styles) for key, (styles, exclusive) in by_artist.items()
+             if exclusive and styles]
+    if locks:
+        S.rebuild_artist_rollup(connection)
+        for key, style_ids in locks:
+            _lock_artist(connection, key, style_ids)
     return len(plan), errors
 
 
@@ -478,14 +503,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         connection.commit()
 
         normalizer = Normalizer(connection, config)
+        result = normalize_library(normalizer, connection, config, dry_run=args.dry_run,
+                                   only_unresolved=args.only_unresolved)
         overridden, errors = apply_overrides(normalizer, connection, config, dry_run=args.dry_run)
         for message in errors:
             print(f"      ERROR   {message}")
         if overridden:
             S.log(f"human overrides applied to {S.human(overridden)} tracks")
-
-        result = normalize_library(normalizer, connection, config, dry_run=args.dry_run,
-                                   only_unresolved=args.only_unresolved)
         if not args.dry_run:
             S.refresh_style_counts(connection)
             S.refresh_track_primary(connection)

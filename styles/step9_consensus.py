@@ -229,7 +229,8 @@ def analyse(entries: Sequence[Label], *, min_sources: int,
             # or an agreement nobody is sure about. The known gaps ("vague",
             # "unlabelled") are not mistakes - the enrichment steps own those.
             "review": decision in ("conflict", "disputed", "mismatch")
-                      or (decision == "agree" and confidence < review_confidence),
+                      or (decision == "agree" and (confidence < review_confidence
+                                                    or winner_label.confidence < review_confidence)),
             # Only a genuine agreement of several independent sources is kept.
             "write": decision == "agree" and n_specific >= min_sources,
             "voters": voters}

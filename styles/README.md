@@ -248,7 +248,11 @@ python3 step3_vocabulary.py --all && python3 step4_normalize.py
 
 `data/overrides.json` always wins over every automatic layer - per artist, per
 album (`"Artist :: Album"`) or per file path. An empty style list means "no
-style at all", so the track is never picked by a style filter.
+style at all", so the track is never picked by a style filter. Add
+`"exclusive": true` to an override to turn it into a lock: every automatic
+label of the matched tracks is removed, so only your `styles` list remains.
+The lock is re-applied by every `step4_normalize.py` run, and the artist
+roll-up is updated to match.
 
 ## How the player uses it
 
