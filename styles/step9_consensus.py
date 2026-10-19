@@ -5,7 +5,7 @@ The earlier steps each look at one kind of evidence on their own:
 
     tag / rules   the genre the owner wrote in the file
     audio         what the track *sounds* like (step 7)
-    external      Wikidata / MusicBrainz / Wikipedia (step 6)
+    external      Metal-API (metal-api.dev, data from Metal Archives; step 6)
     llm           what DeepSeek knows about the artist (step 5)
 
 None of them ever looks at the whole picture of a track, and none of them

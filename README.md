@@ -567,7 +567,7 @@ Tkinter UI (ui.py) ──state snapshots── PlayerEngine (player.py)
 | `discord_cover.py` | uploads a downscaled cover to an anonymous image host so Discord can fetch it (opt-in, see below) |
 | `dnd.py` | drop target for the file manager (XDND via tkdnd/tkinterdnd2, optional) |
 | `selftest.py` | offline self-test: fake Jellyfin server + generated audio (see below) |
-| `styles/` | the standalone builder that produces `catalog.sqlite` (scan → link → vocabulary → normalize → optional LLM → report); `review_gui.py` is the optional manual review tool, with its own `selftest_review.py`; never used while playing |
+| `styles/` | the standalone builder that produces `catalog.sqlite` (scan → link → vocabulary → normalize → optional Metal-API/LLM → report); `review_gui.py` is the optional manual review tool, with its own `selftest_review.py`; never used while playing |
 | `install.sh` | installs/removes the menu entry and the icon (see below) |
 | `simplejellymus.desktop` | launcher template (`@APPDIR@` is filled in by `install.sh`) |
 | `assets/fire_icon_variant_1.png` | application icon (1024×1024 master, installed in several sizes) |

@@ -17,7 +17,7 @@ into one SQLite database. The player only ever *reads* that database.
       │                        ├── vocabulary + rules ──────► canonical styles (step3/4)
       │                        │
       │                        ├── DeepSeek (optional) ─────► artist knowledge (step5)
-      │                        ├── Wikidata / MusicBrainz ──► external styles (step6, not built)
+      │                        ├── Metal-API (metal/unknown) ► external styles (step6)
       └── audio excerpt ──────►► acoustic classifier ──────► objective styles (step7)
                                                         (fills what is missing AND
                                                          audits everything else)
@@ -40,7 +40,7 @@ the same track+style, so the pipeline is safe to re-run at any time:
 | `rules`      |  70  | that same tag cleaned, split, translated (`data/styles.json`, `data/rules.json`) |
 | `audio`      |  60  | the acoustic classifier listening to the track |
 | `consensus`  |  55  | step 9: several independent sources agreed (it can *promote* that agreement) |
-| `external`   |  50  | Wikipedia / Wikidata / MusicBrainz |
+| `external`   |  50  | Metal-API (`metal-api.dev`, data from Metal Archives) |
 | `llm`        |  40  | DeepSeek's knowledge about the artist |
 | `propagated` |  30  | step 9: inferred from the album/artist of the track |
 
@@ -54,6 +54,8 @@ python3 step2_link.py --dry-run       # 2. check the Jellyfin path mapping
 python3 step2_link.py                 #    then link item ids            (~10 min on a Pi)
 python3 step3_vocabulary.py --all     # 3. vocabulary + coverage report
 python3 step4_normalize.py            # 4. raw tags -> canonical styles (seconds)
+python3 step6_metal_api.py --estimate # 6. Metal-API: candidates/time, no network
+python3 step6_metal_api.py --fill     #    metal + unknown, album-confirmed
 python3 step9_consensus.py            # 9. propagate + vote over every source
 
 python3 step7_classify.py --setup     # 7a. models + venv (once, ~700 MB)
@@ -70,19 +72,78 @@ python3 step8_report.py               # 8. health report + picker preview
 python3 styles_db.py                  # state of the dataset, any time
 ```
 
-> **Step 6 (Wikipedia / Wikidata / MusicBrainz) is not implemented.** It was in
-> the original plan, but DeepSeek covers the same question with far better
-> coverage on obscure bands (MusicBrainz and Wikidata resolved only about 6 of
-> 10 sample artists each, and no single free source knew the long tail). The
-> database already reserves the `external` source rank and the
-> `artists.external_json` column, so it can be added later without any change to
-> the schema.
+> **Step 6 is the Metal-API lookup.** It uses `metal-api.dev` (metal-only data
+> from Metal Archives) to fill artists that have no style yet. By default it
+> queries artists already known to be metal/hardcore **and** artists with no
+> style and no tag; an unknown artist is only written when one of its albums
+> matches the API band. Known non-metal artists are skipped unless
+> `--all-candidates` is used. No API key is required. See
+> [Metal-API (step 6)](#metal-api-step-6).
 
-`prepare_styles.sh` runs steps 1-4, 9 and 8 in the right order.
+`prepare_styles.sh` runs steps 1-4, 6, 9 and 8 in the right order.
 
 Every step is idempotent and resumable: re-running only does the work that is
 missing, and nothing is ever lost (`tracks.raw_genre` keeps the original tag
 forever, so any layer can be recomputed).
+
+## Metal-API (step 6)
+
+`step6_metal_api.py` uses [metal-api.dev](https://metal-api.dev), an approved
+JSON API over Metal Archives data. It needs **no API key** and only serves metal
+bands, but it is useful for artists whose files carry no genre tag.
+
+What it can find:
+
+* **known metal/hardcore** artists whose tracks still lack a style (35 artists /
+  211 tracks in this library) - a unique exact band name is accepted;
+* **unknown artists** with no style and no tag (134 artists / 1,491 tracks) -
+  accepted only when the band name is exact **and** at least one API album
+  matches an album in this library (13 Dead, Fracturus and Throne of Roaches are
+  confirmed this way);
+* **known non-metal** artists are skipped by default. Add `--all-candidates` to
+  query all 407 candidates as well; these also require an album match.
+
+Band search is exact-name filtered (the API returns fuzzy matches), and the
+existing `Normalizer` maps the API genre strings (`Death Metal (early);
+Progressive Death Metal (later)` becomes two styles). Everything it writes uses
+`source='external'`; the evidence is
+`metal-api: <genre> (https://www.metal-archives.com/bands/...)`.
+
+```bash
+python3 step6_metal_api.py --estimate                 # counts and time, no network
+python3 step6_metal_api.py --fill                     # metal + unknown
+python3 step6_metal_api.py --fill --known-metal-only  # the 35 safe artists
+python3 step6_metal_api.py --fill --all-candidates    # all 407
+python3 step6_metal_api.py --artist "13 Dead"         # one band
+python3 step6_metal_api.py --artist "Kadjo"           # reports not found
+python3 step6_metal_api.py --limit 25 --dry-run
+python3 step6_metal_api.py --refresh                  # ignore the cache
+```
+
+`--strict` requires an album match for every artist. `--loose` allows a unique
+exact unknown match without an album match (lower confidence). `--all-tracks`
+writes to the whole artist instead of only the tracks that need a style.
+
+Rate limiting and cache:
+
+* the server allows 30 requests / 10 s; the client waits **0.5 s** by default
+  (2 requests/s), reads the `X-Rate-Limit-Remaining` / `Reset` headers and backs
+  off on 429/5xx;
+* every answer is cached in `artists.external_json["metal_api"]`, including
+  `not_found`, `unconfirmed` and `ambiguous`; a cached `found` answer is
+  re-applied to newly added tracks for free;
+* `--refresh` re-queries; `--estimate` shows the candidate counts and an upper
+  bound for requests/time;
+* nothing is written until an exact name (and, for unknown artists, an album
+  match) is found;
+* `out/metal_api_report.txt`, `metal_api_matches.csv`,
+  `metal_api_unconfirmed.csv`, `metal_api_ambiguous.csv` and
+  `metal_api_unmapped.csv` explain every decision.
+
+Known limits: the API only has metal bands, so Kadjo and other non-metal artists
+remain for step 5 (DeepSeek) or the manual review GUI. A mis-tagged folder whose
+artist name is wrong (for example a "Chrysalis" folder that is really Throne of
+Roaches) is not resolved by a band-name search; use the review GUI.
 
 ## Reviewing missing or wrong styles (GUI)
 
@@ -281,9 +342,9 @@ Propagation is not a voter (it only echoes). Then:
   (the sources split across families), `mismatch` (same family, different style)
   and low-confidence agreements. `out/consensus_report.txt` summarises the run.
 
-On the current dataset (tags + rules + LLM only, no audio/external yet) the vote
+On the current dataset (tags + rules + Metal-API + LLM, no audio yet) the vote
 finds 39 conflicts and 3 mismatches out of 41 139 tracks - the short, honest list
-worth a human look. Once step 6/7 add their evidence, `step9_consensus.py` is the
+worth a human look. Once step 7 adds its evidence, `step9_consensus.py` is the
 step that turns an agreement among them into labels.
 
 ## Editing the vocabulary
