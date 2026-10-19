@@ -221,6 +221,17 @@ on the next start, so you can keep a "normal" filter and only change it when you
 feel like it. `--style` overrides it for that single run, so a one-off
 `python3 main.py --style "Black Metal"` leaves your usual choice alone.
 
+If a style is missing or wrong, the optional review tool can fix it by hand:
+
+```bash
+python3 styles/review_gui.py
+```
+
+It lists the unlabelled or low-confidence tracks, previews them through mpv and
+saves a `human`/manual override (see `styles/README.md`). It is a separate tool;
+the player itself still opens the catalog read-only. The review tool is new and
+not fully tested against every library — start with a small queue.
+
 The app starts **windowed** (remembering the size and fullscreen/windowed mode
 you used last time) and `Esc` switches between windowed and fullscreen.
 
@@ -556,7 +567,7 @@ Tkinter UI (ui.py) ──state snapshots── PlayerEngine (player.py)
 | `discord_cover.py` | uploads a downscaled cover to an anonymous image host so Discord can fetch it (opt-in, see below) |
 | `dnd.py` | drop target for the file manager (XDND via tkdnd/tkinterdnd2, optional) |
 | `selftest.py` | offline self-test: fake Jellyfin server + generated audio (see below) |
-| `styles/` | the standalone builder that produces `catalog.sqlite` (scan → link → vocabulary → normalize → optional LLM → report); it is never used while playing |
+| `styles/` | the standalone builder that produces `catalog.sqlite` (scan → link → vocabulary → normalize → optional LLM → report); `review_gui.py` is the optional manual review tool, with its own `selftest_review.py`; never used while playing |
 | `install.sh` | installs/removes the menu entry and the icon (see below) |
 | `simplejellymus.desktop` | launcher template (`@APPDIR@` is filled in by `install.sh`) |
 | `assets/fire_icon_variant_1.png` | application icon (1024×1024 master, installed in several sizes) |

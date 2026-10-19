@@ -84,6 +84,59 @@ Every step is idempotent and resumable: re-running only does the work that is
 missing, and nothing is ever lost (`tracks.raw_genre` keeps the original tag
 forever, so any layer can be recomputed).
 
+## Reviewing missing or wrong styles (GUI)
+
+When automatic detection fails — no genre tag, no style, a family-only label or a
+low-confidence entry in `out/review.csv` — use the small Tkinter review tool:
+
+> **Status:** this tool is new and not fully tested against every library.
+> Start with a small queue; every save backs up `overrides.json` in `out/`.
+
+```bash
+cd styles
+python3 review_gui.py
+```
+
+It lists the tracks in a queue (`No style`, `No genre tag`, `Vague / family
+only`, `Review queue (CSV)` or `All tracks`), plays a 60-second preview through
+mpv, and lets you type in the style box to find a style instantly. The first
+match is highlighted; Enter selects it.
+
+Saving writes the verdict in two places:
+
+* `data/overrides.json` (the permanent manual record, with a backup in `out/`);
+* `catalog.sqlite`, immediately, through the same `apply_overrides()` used by
+  `step4_normalize.py`.
+
+The database label therefore has `source='human'`, `tracks.label_source='human'`
+and `confidence=1.0`. The player sees it on the next style query — reopen the
+`G` panel to refresh its list/counts. No music file and no Jellyfin data is
+touched.
+
+Useful details:
+
+* **Save to track / album / artist** buttons show how many tracks they affect.
+  For album names that are really labels (`UniqueLeaderRecords`, `20BuckSpin`),
+  the GUI warns and recommends album/track-level saves.
+* **Exclusive** (default on) removes the old automatic labels for the saved
+  tracks, so the manual verdict is the only one left.
+* **Mark unknown** writes an empty, exclusive override (no style at all).
+* **Clear override** removes the manual entry and its human labels; run
+  `step4_normalize.py` / `step9_consensus.py` afterwards if you want the
+  automatic labels rebuilt.
+
+Headless check (no window):
+
+```bash
+python3 review_gui.py --list no_style --limit 10
+```
+
+The review tool has its **own** test, separate from the player's `selftest.py`:
+
+```bash
+python3 selftest_review.py
+```
+
 ## The dataset (`catalog.sqlite`)
 
 By default `~/.local/share/simplejellymus/catalog.sqlite` (set `db_path` in
