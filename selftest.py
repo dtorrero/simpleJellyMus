@@ -1701,7 +1701,15 @@ def test_instance(report: Reporter) -> None:
     report.check("the socket is private to this user", mode == 0o600, oct(mode))
 
     focused = []
-    first.listen(lambda: focused.append(time.time()))
+    remote = []
+
+    def handle_remote(command):
+        remote.append(command)
+        if command == "boom":
+            raise RuntimeError("handler exploded")
+        return {"state": "playing", "title": "Song", "volume": 42}
+
+    first.listen(lambda: focused.append(time.time()), handle_remote)
 
     report.check("a second copy does not start another instance",
                  instance.SingleInstance(path=path).acquire() is False)
@@ -1714,6 +1722,39 @@ def test_instance(report: Reporter) -> None:
     report.check("every later copy focuses the same window again",
                  wait_for(lambda: len(focused) >= 3, 3.0) is not None,
                  f"{len(focused)} focus calls")
+
+    # The same socket carries the remote commands the deck/scripts use: one
+    # command line in, one JSON line back.
+    focus_calls = len(focused)
+    client = instance.SingleInstance(path=path)
+    reply = client.send(instance.COMMAND_STATUS)
+    report.check("a remote command is answered with its JSON reply",
+                 isinstance(reply, dict) and reply.get("title") == "Song", str(reply))
+    report.check("the reply names the command that was run",
+                 (reply or {}).get("command") == instance.COMMAND_STATUS, str(reply))
+    report.check("remote commands do not count as a focus request",
+                 len(focused) == focus_calls, f"{len(focused)} focus calls")
+    played = client.send(instance.COMMAND_PLAY_PAUSE)
+    report.check("commands are forwarded to the application in order",
+                 played is not None and remote[-1] == instance.COMMAND_PLAY_PAUSE,
+                 str(remote))
+    broken = client.send("boom")
+    report.check("a command whose handler raises is reported as an error",
+                 isinstance(broken, dict) and broken.get("ok") is False
+                 and "handler exploded" in str(broken.get("error")), str(broken))
+    report.check("the listener survives a failing command",
+                 (client.send(instance.COMMAND_STATUS) or {}).get("title") == "Song")
+    report.check("send() returns None when nothing is listening",
+                 instance.SingleInstance(path=runtime / "nobody.sock").send("status") is None)
+
+    bare_path = runtime / "bare.sock"
+    bare = instance.SingleInstance(path=bare_path)
+    bare.acquire()
+    bare.listen(lambda: None)               # a window with no command handler
+    refused = instance.SingleInstance(path=bare_path).send(instance.COMMAND_NEXT)
+    report.check("without a command handler the guard refuses politely",
+                 isinstance(refused, dict) and refused.get("ok") is False, str(refused))
+    bare.close()
 
     # A crashed copy leaves the socket file behind: it must not block a restart.
     stale_path = runtime / "stale.sock"

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import json
 import queue
 import re
 import signal
@@ -34,6 +35,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from PIL import Image, ImageTk
 
+import instance
 import jellyfin
 from instance import SingleInstance
 from jellyfin import AuthError, JellyfinClient, JellyfinError
@@ -434,6 +436,69 @@ class Application:
         except Exception:
             pass
 
+    # --------------------------------------------------------- remote commands
+    def remote_status(self) -> Dict[str, Any]:
+        """What is playing right now - for scripts, KDE shortcuts and the deck.
+
+        Everything is read from :meth:`PlayerEngine.snapshot`, which takes the
+        engine's own lock, so this is safe from any thread.
+        """
+        engine = self.engine
+        if engine is None:
+            return {"running": True, "playing": False, "paused": False,
+                    "state": "idle", "title": "", "artist": "", "album": "",
+                    "position": 0.0, "duration": 0.0, "volume": 0,
+                    "status": "", "error": "", "server": "", "user": self.client.username
+                              if self.client is not None else ""}
+        state = engine.snapshot() or {}
+        current = state.get("current") or {}
+        paused = bool(state.get("paused"))
+        return {
+            "running": True,
+            "playing": bool(current),
+            "paused": paused,
+            "state": "paused" if (current and paused) else ("playing" if current else "idle"),
+            "title": JellyfinClient.display_title(current) if current else "",
+            "artist": JellyfinClient.display_artist(current) if current else "",
+            "album": str(current.get("Album") or ""),
+            "position": round(float(state.get("position") or 0.0), 1),
+            "duration": round(float(state.get("duration") or 0.0), 1),
+            "volume": int(state.get("volume") or 0),
+            "status": str(state.get("status") or ""),
+            "error": str(state.get("error") or ""),
+            "server": str(state.get("server") or ""),
+            "user": str(state.get("user") or ""),
+        }
+
+    def handle_external_command(self, command: str) -> Optional[Dict[str, Any]]:
+        """Run one command coming from the single-instance socket.
+
+        The guard calls this from its helper thread. The engine methods are
+        thread-safe (they take their own locks and talk to mpv directly), so the
+        Tk widgets never have to be touched from the outside - the UI simply
+        receives the usual state update the engine emits.
+        """
+        if command == instance.COMMAND_STATUS:
+            return self.remote_status()
+        if command == instance.COMMAND_QUIT:
+            self.request_shutdown()
+            return {"status": "closing"}
+        engine = self.engine
+        if engine is None:
+            return {"ok": False, "error": "nothing is playing yet",
+                    **self.remote_status()}
+        actions: Dict[str, Callable[[], None]] = {
+            instance.COMMAND_PLAY_PAUSE: engine.toggle_pause,
+            instance.COMMAND_NEXT: engine.next_track,
+            instance.COMMAND_PREVIOUS: engine.previous_track,
+            instance.COMMAND_RESTART: engine.restart_track,
+        }
+        action = actions.get(command)
+        if action is None:
+            return {"ok": False, "error": f"unknown command {command!r}"}
+        action()
+        return self.remote_status()
+
     def shutdown(self) -> None:
         if self._closing:
             return
@@ -455,6 +520,18 @@ class Application:
             self.root.destroy()
         except tk.TclError:
             pass
+
+#: Command line flag -> command sent over the single-instance socket.
+REMOTE_FLAGS = (
+    ("play_pause", instance.COMMAND_PLAY_PAUSE),
+    ("next", instance.COMMAND_NEXT),
+    ("previous", instance.COMMAND_PREVIOUS),
+    ("restart", instance.COMMAND_RESTART),
+    ("focus", instance.COMMAND_FOCUS),
+    ("status", instance.COMMAND_STATUS),
+    ("quit", instance.COMMAND_QUIT),
+)
+
 
 def parse_args(argv):
     parser = argparse.ArgumentParser(
@@ -493,7 +570,63 @@ def parse_args(argv):
                         help="which field Discord shows as the status text in the"
                              " member list: details (the song title, the default),"
                              " state (artist and album) or name (the application)")
+
+    remote = parser.add_argument_group(
+        "remote control", "drive the copy that is already running, then exit")
+    remote.add_argument("--play-pause", action="store_true",
+                        help="pause or resume the current song")
+    remote.add_argument("--next", action="store_true", help="skip to the next random song")
+    remote.add_argument("--previous", action="store_true",
+                        help="go back (restarts the song after the first 5 s)")
+    remote.add_argument("--restart", action="store_true", help="restart the current song")
+    remote.add_argument("--focus", action="store_true",
+                        help="bring the running window to the front")
+    remote.add_argument("--status", action="store_true",
+                        help="print what is playing right now")
+    remote.add_argument("--quit", action="store_true",
+                        help="close the running player (same as the Quit button)")
+    remote.add_argument("--json", action="store_true",
+                        help="with --status: print the raw JSON reply")
     return parser.parse_args(argv)
+
+
+def remote_command(options: argparse.Namespace) -> str:
+    """The remote command asked for on the command line ('' when none).
+
+    These flags make the player scriptable (KDE shortcuts, the Stream Deck):
+    they are sent over the single-instance socket and the program exits without
+    opening a window.
+    """
+    for flag, command in REMOTE_FLAGS:
+        if getattr(options, flag, False):
+            return command
+    return ""
+
+
+def run_remote_command(command: str, as_json: bool = False) -> int:
+    """Send one remote command to the running player and report the result."""
+    reply = SingleInstance().send(command)
+    if reply is None:
+        print("SimpleJellyMus is not running.", file=sys.stderr)
+        return 1
+    if as_json:
+        print(json.dumps(reply))
+        return 0 if reply.get("ok", True) else 1
+    if not reply.get("ok", True):
+        print(f"SimpleJellyMus refused {command}: {reply.get('error')}", file=sys.stderr)
+        return 1
+    if command == instance.COMMAND_STATUS:
+        if not reply.get("playing"):
+            print("SimpleJellyMus is running but nothing is playing yet.")
+            return 0
+        where = "paused" if reply.get("paused") else "playing"
+        print(f"{where}: {reply.get('artist') or '?'} - {reply.get('title') or '?'}"
+              f"  [{float(reply.get('position') or 0):.0f}/"
+              f"{float(reply.get('duration') or 0):.0f}s]"
+              f"  volume {reply.get('volume') or 0}%")
+        return 0
+    print(f"Sent {command} to SimpleJellyMus.")
+    return 0
 
 
 def install_signal_handlers(app: "Application") -> None:
@@ -583,6 +716,12 @@ def validate_style_request(options) -> int:
 def main(argv=None) -> int:
     options = parse_args(sys.argv[1:] if argv is None else argv)
 
+    # Remote commands (--play-pause, --next, --status, ...) drive the copy that is
+    # already running and exit here, without opening a window.
+    remote = remote_command(options)
+    if remote:
+        return run_remote_command(remote, as_json=bool(getattr(options, "json", False)))
+
     status = validate_style_request(options)
     if status:
         return status
@@ -609,7 +748,7 @@ def main(argv=None) -> int:
 
         app = Application(root, options)
         install_signal_handlers(app)
-        guard.listen(app.focus_window)
+        guard.listen(app.focus_window, app.handle_external_command)
         try:
             root.mainloop()
         except KeyboardInterrupt:

@@ -639,6 +639,41 @@ simply plays random songs - a stale config never keeps the music from starting.
 | Discord shows "Jellyfin" instead of your own name and images | that is the borrowed application id - pass `--discord-client-id` with your own application, see [Discord Rich Presence](#discord-rich-presence) |
 | Discord still shows the static logo instead of the cover | `--discord-cover` was not given, or litterbox.catbox.moe could not be reached; `--debug` prints `[discord] artwork published ...` or why it did not |
 
+## Remote control (scripts, KDE shortcuts, Stream Deck)
+
+While the player is running it listens on a small per-user socket
+(`$XDG_RUNTIME_DIR/simplejellymus.sock` - the same one the single-instance guard
+uses), so anything on the machine can drive it without stealing the keyboard
+focus. Two equivalent ways:
+
+```bash
+python3 main.py --status --json      # what is playing right now (title, artist, position...)
+python3 main.py --play-pause         # pause or resume
+python3 main.py --next               # next random song
+python3 main.py --previous           # back (restarts the song in the first 5 s)
+python3 main.py --restart            # start the current song over
+python3 main.py --focus              # bring the window to the front
+python3 main.py --status             # one readable line
+python3 main.py --quit               # close the player (same as the Quit button)
+```
+
+A client may also speak the protocol directly: send one command line to the
+socket and read back one JSON line.
+
+| Command | Answer (JSON) |
+|---|---|
+| `status` | `running`, `playing`, `paused`, `state`, `title`, `artist`, `album`, `position`, `duration`, `volume`, `server`, `user` |
+| `play_pause`, `next`, `previous`, `restart`, `focus`, `quit` | the same status, after the command ran |
+| anything else | `{"ok": false, "error": "unknown command ..."}` |
+
+```bash
+printf 'status\n' | socat - UNIX-CONNECT:"$XDG_RUNTIME_DIR/simplejellymus.sock"
+```
+
+The socket is `0600` and only exists while the player runs, so no other account
+can control it. A failing command can never take the listener down (the player
+keeps answering), and `main.py --next` when nothing is running simply exits 1.
+
 ## Desktop app
 
 ```bash
