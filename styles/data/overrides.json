@@ -34,14 +34,283 @@
     "Style names must match data/styles.json. Run step4_normalize.py again",
     "after editing this file; it re-applies the overrides to the whole library."
   ],
-
   "artists": {
     "Kadjo": {
-      "styles": ["Deathcore", "Metalcore"],
+      "styles": [
+        "Deathcore",
+        "Metalcore"
+      ],
       "exclusive": true,
       "note": "Manual fix: the LLM guessed Hip Hop/Trap/Rap Metal; the band is Deathcore/Metalcore. The files carry no genre tag."
+    },
+    "Access Denied": {
+      "styles": [
+        "Electro House"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Access Denied, Jellyfish": {
+      "styles": [
+        "Electro House"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Aiden Malacaria": {
+      "styles": [
+        "Deathcore"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Algetic": {
+      "styles": [
+        "Technical Death Metal Brutal"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Apex Jones": {
+      "styles": [
+        "Electronic"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "ARMA": {
+      "styles": [
+        "Electronic"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "ataraxia nz": {
+      "styles": [
+        "Electronic"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Ayra Recordings": {
+      "styles": [
+        "Electronic"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Blood Ritual": {
+      "styles": [
+        "Heavy Metal"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Buddy Ruckus": {
+      "styles": [
+        "Pop Punk"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Blue Stahli VS The Beach Boys": {
+      "styles": [
+        "Electronic"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Breathing Underwater": {
+      "styles": [
+        "Electronic"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Cariousus": {
+      "styles": [
+        "Melodic Death Metal"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Chao Doctrine": {
+      "styles": [
+        "Death Metal"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Curbsquirrels": {
+      "styles": [
+        "Pop Punk"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Davip": {
+      "styles": [
+        "Electronic"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Davip, Imetic": {
+      "styles": [
+        "Electronic"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Davip, DM": {
+      "styles": [
+        "Electronic"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Delucide": {
+      "styles": [
+        "Death Metal"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Evan Gamble Lewis": {
+      "styles": [
+        "Electronic"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Evan Gamble Lewis feat. Shea Taylor": {
+      "styles": [
+        "Electronic"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Face Yourself": {
+      "styles": [
+        "Deathcore"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Friendly DorX": {
+      "styles": [
+        "Skate Punk"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "HOPE": {
+      "styles": [
+        "Skate Punk"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Humanity Gone": {
+      "styles": [
+        "Progressive Metal"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "melodeath": {
+      "styles": [
+        "Melodic Death Metal"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Passage 4": {
+      "styles": [
+        "Skate Punk"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Sick Shift": {
+      "styles": [
+        "Skate Punk"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Smash the Covid19": {
+      "styles": [
+        "Punk (unspecified)"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "UniqueLeaderRecords": {
+      "styles": [
+        "Compilation"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Logos": {
+      "styles": [
+        "Punk Rock"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
     }
   },
-  "albums": {},
+  "albums": {
+    "20BuckSpin :: 20BuckSpin": {
+      "styles": [
+        "Compilation"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "3D Stas :: The Heat": {
+      "styles": [
+        "Electronic"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "3D Stas :: Anger / Nothing but Deceit": {
+      "styles": [
+        "Drum and Bass"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "? :: Quicksand (USA)": {
+      "styles": [
+        "Alternative Metal"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "A200Club :: Once In A Lifetime": {
+      "styles": [
+        "Punk Rock"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Advantage :: Say Your Best, Do Your Worst": {
+      "styles": [
+        "Pop Punk"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "melodeath2 :: melodeath2": {
+      "styles": [
+        "Melodic Death Metal"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    }
+  },
   "tracks": {}
 }
