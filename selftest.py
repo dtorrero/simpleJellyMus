@@ -144,18 +144,23 @@ class FakeJellyfin(BaseHTTPRequestHandler):
     def _json(self, status: int, data) -> None:
         self._reply(status, json.dumps(data).encode("utf-8"))
 
-    def _authorised(self, query=None) -> bool:
-        """Real Jellyfin accepts either the auth header or ``?api_key=``."""
-        if f'Token="{TOKEN}"' in self.headers.get("X-Emby-Authorization", ""):
+    def _authorised(self, query=None, *, media: bool = False) -> bool:
+        """Jellyfin 12 only accepts the standard ``Authorization`` header.
+
+        Media URLs may still carry ``?api_key=`` because mpv receives nothing
+        but the URL; the player keeps that query for older releases as well.
+        """
+        if f'Token="{TOKEN}"' in self.headers.get("Authorization", ""):
             return True
-        return bool(query) and query.get("api_key") == [TOKEN]
+        return media and bool(query) and query.get("api_key") == [TOKEN]
 
     def do_GET(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
         parsed = urlparse(self.path)
         path, query = parsed.path, parse_qs(parsed.query)
         if path == "/System/Info/Public":
             return self._json(200, {"ServerName": "Selftest Jellyfin", "Version": "10.10.3"})
-        if not self._authorised(query):
+        media = path.startswith(("/Audio/", "/Items/"))
+        if not self._authorised(query, media=media):
             return self._json(401, {"error": "unauthorised"})
         if path == "/Users/Me":
             return self._json(200, {"Id": "user-1", "Name": "tester"})
@@ -176,7 +181,7 @@ class FakeJellyfin(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(length) or b"{}")
         if path != "/Users/authenticatebyname":
             return self._json(404, {"error": "no route"})
-        if 'Client="SimpleJellyMus"' not in self.headers.get("X-Emby-Authorization", ""):
+        if 'Client="SimpleJellyMus"' not in self.headers.get("Authorization", ""):
             return self._json(400, {"error": "missing client header"})
         if body.get("Username") != "tester" or body.get("Pw") != "secret":
             return self._json(401, {"error": "bad credentials"})
@@ -390,6 +395,10 @@ def track_changed(engine, previous_id: str, timeout: float = 25.0):
 
 def test_client(report: Reporter, port: int) -> JellyfinClient:
     client = JellyfinClient(f"http://127.0.0.1:{port}")
+    headers = client._headers()
+    report.check("the client sends the standard Authorization header",
+                 "Authorization" in headers and "X-Emby-Authorization" not in headers,
+                 ", ".join(sorted(headers)))
     info = client.test_connection()
     report.check("server info is readable", info.get("ServerName") == "Selftest Jellyfin",
                  str(info.get("ServerName")))

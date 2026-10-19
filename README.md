@@ -108,7 +108,9 @@ with the cover art on screen and no silence between tracks.
 
 You need a **Jellyfin server you can reach** and an account on it; the app asks
 for the address and login the first time you start it (see
-[First run](#first-run)) and never asks again.
+[First run](#first-run)) and never asks again. The client uses Jellyfin's
+standard `Authorization` header, so it works with Jellyfin 10.x and 12.x (which
+disables the legacy `X-Emby-Authorization` header by default).
 
 | Component | Status on this machine |
 |---|---|
@@ -623,6 +625,7 @@ simply plays random songs - a stale config never keeps the music from starting.
 | `--reset-login` says "already running" | quit the player first; the guard will not delete the login of a running instance |
 | "Cannot reach ..." on start | the Jellyfin server is down or the URL is wrong; fix it with **Change account** |
 | "Login expired" | the saved token was revoked: log in again |
+| `Jellyfin returned HTTP 400` when logging in (Jellyfin 12) | Jellyfin 12 disables the legacy `X-Emby-Authorization` header; update SimpleJellyMus (this version sends the standard `Authorization` header) or temporarily re-enable legacy authorization on the server |
 | No sound | check the sink with `pactl list short sinks`; mpv uses `--ao=pulse,alsa` |
 | A track fails to decode | the player skips it and continues with the next random song |
 | Covers missing | the library has no artwork for that release; a placeholder is shown |

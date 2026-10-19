@@ -255,7 +255,9 @@ class JellyfinClient:
         active = self.access_token if token is _STORED_TOKEN else token
         if active:
             value += f', Token="{active}"'
-        headers = {"X-Emby-Authorization": value}
+        # Jellyfin 12 disables the legacy X-Emby-Authorization header by default;
+        # the standard Authorization header works on 10.x as well.
+        headers = {"Authorization": value}
         if accept:
             headers["Accept"] = accept
         return headers

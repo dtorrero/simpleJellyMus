@@ -71,8 +71,9 @@ class Client:
             "EnableTotalRecordCount": "true",
         }
         url = f"{self.base}/Users/{self.user}/Items?" + urllib.parse.urlencode(params)
+        # Jellyfin 12 no longer accepts the legacy X-Emby-Authorization header.
         request = urllib.request.Request(url, headers={
-            "X-Emby-Authorization": (
+            "Authorization": (
                 'MediaBrowser Client="SimpleJellyMus", Device="styles-builder",'
                 f' DeviceId="styles-builder", Version="0.1", Token="{self.token}"'),
             "Accept": "application/json",
