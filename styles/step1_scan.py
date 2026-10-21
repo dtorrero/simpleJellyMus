@@ -411,9 +411,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             listing.write_text("\n".join(failed), encoding="utf-8")
             S.log("unreadable files listed in", str(listing))
         if args.prune:
-            removed = prune(connection, "", [entry[0] for entry in entries])
-            connection.commit()
-            S.log(f"pruned rows (file gone): {S.human(removed)}")
+            if not entries:
+                # An unmounted/moved root looks exactly like an empty library.
+                S.log("refusing to prune: no audio files were found under "
+                      f"{root} (nothing was deleted)")
+            else:
+                removed = prune(connection, "", [entry[0] for entry in entries])
+                connection.commit()
+                S.refresh_style_counts(connection)
+                connection.commit()
+                S.log(f"pruned rows (file gone): {S.human(removed)}")
 
         S.log("updating the raw genre list…")
         distinct = refresh_raw_genres(connection)

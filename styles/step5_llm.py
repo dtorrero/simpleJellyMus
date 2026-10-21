@@ -221,10 +221,21 @@ def parse_json_block(text: str) -> Dict[str, Any]:
 # --------------------------------------------------------------------------- #
 
 def vocabulary_names(connection) -> List[str]:
-    """The closed vocabulary: real styles only (no family placeholders)."""
-    return [row["name"] for row in connection.execute(
-        "SELECT name FROM styles WHERE name NOT LIKE '%(unspecified)'"
+    """The closed vocabulary: real styles only (no family placeholders).
+
+    A name used in more than one family is listed as ``Family::Name`` so the
+    model can pick the exact variant; unique names stay short.
+    """
+    rows = [dict(row) for row in connection.execute(
+        "SELECT name, family FROM styles WHERE name NOT LIKE '%(unspecified)'"
         " ORDER BY family, name")]
+    counts: Dict[str, int] = {}
+    for row in rows:
+        key = S.norm_key(row["name"])
+        counts[key] = counts.get(key, 0) + 1
+    return [S.style_ref(row["family"], row["name"])
+            if row["family"] and counts.get(S.norm_key(row["name"]), 0) > 1
+            else str(row["name"]) for row in rows]
 
 
 def prompt_fingerprint(config: Dict[str, Any], vocabulary: Sequence[str]) -> str:
@@ -315,6 +326,8 @@ def system_prompt(vocabulary: Sequence[str]) -> str:
     return (
         "You classify music artists into styles.\n"
         "Answer ONLY with names taken verbatim from the VOCABULARY below.\n"
+        "A name written as Family::Name is one exact style when that name exists\n"
+        "in several families; otherwise return the plain name.\n"
         "Never invent a style, never translate, never add anything else.\n"
         "If you do not know the artist, return an empty list and confidence 0.1.\n"
         "At most 3 styles per artist, ordered from the most defining to the least.\n"
@@ -354,10 +367,18 @@ def style_lookup(connection) -> Dict[str, str]:
     can never introduce a style of its own invention.
     """
     from step3_vocabulary import normalize_raw
+    rows = list(connection.execute(
+        "SELECT id, name, family, aliases FROM styles"
+        " WHERE name NOT LIKE '%(unspecified)' ORDER BY rowid"))
     lookup: Dict[str, str] = {}
-    for row in connection.execute(
-            "SELECT id, name, aliases FROM styles WHERE name NOT LIKE '%(unspecified)'"):
-        lookup[normalize_raw(row["name"])] = row["id"]
+    # Names first (the first duplicate stays the bare-name default), then the
+    # explicit Family::Name references, then aliases.
+    for row in rows:
+        lookup.setdefault(normalize_raw(row["name"]), row["id"])
+    for row in rows:
+        if row["family"]:
+            lookup.setdefault(S.style_ref_key(row["family"], row["name"]), row["id"])
+    for row in rows:
         for alias in json.loads(row["aliases"] or "[]"):
             key = normalize_raw(alias)
             if key:
@@ -389,10 +410,15 @@ def validate_answers(parsed: Dict[str, Any], batch: Sequence[Dict[str, Any]],
         ids: List[str] = []
         names: List[str] = []
         for style in styles:
-            style_id = lookup.get(normalize_raw(str(style)))
+            raw_style = str(style).strip()
+            ref = S.parse_style_ref(raw_style)
+            if ref is not None:
+                style_id = lookup.get(S.style_ref_key(*ref))
+            else:
+                style_id = lookup.get(normalize_raw(raw_style))
             if style_id and style_id not in ids:
                 ids.append(style_id)
-                names.append(str(style).strip())
+                names.append(raw_style)
             if len(ids) >= max_styles:
                 break
         try:

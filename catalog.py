@@ -51,6 +51,19 @@ def norm_key(text: Any) -> str:
     return _SPACES.sub(" ", _PUNCT.sub(" ", folded)).strip()
 
 
+STYLE_REF_SEPARATOR = "::"
+
+
+def split_style_ref(text: Any) -> Optional[Tuple[str, str]]:
+    """Split an explicit ``Family::Name`` reference (``None`` for a plain name)."""
+    raw = str(text or "").strip()
+    if STYLE_REF_SEPARATOR not in raw:
+        return None
+    family, name = raw.split(STYLE_REF_SEPARATOR, 1)
+    family, name = family.strip(), name.strip()
+    return (family, name) if family and name else None
+
+
 def _similar(left: str, right: str) -> bool:
     """Close enough to be the same word with a typo ("progresive"/"progressive")."""
     return difflib.SequenceMatcher(None, left, right).ratio() >= 0.8
@@ -120,6 +133,7 @@ class Catalog:
         self._lock = threading.RLock()
         self._styles: Optional[List[Dict[str, Any]]] = None
         self._families: Optional[List[Dict[str, Any]]] = None
+        self._name_counts: Optional[Dict[str, int]] = None
 
     # ------------------------------------------------------------- connection
     @property
@@ -263,21 +277,50 @@ class Catalog:
                 break
         return results
 
-    def resolve(self, entries: Iterable[str]) -> Tuple[List[str], List[str]]:
-        """Turn names / aliases / ``family:Name`` into ids and family names.
+    def _style_name_counts(self) -> Dict[str, int]:
+        with self._lock:
+            if self._name_counts is None:
+                counts: Dict[str, int] = {}
+                for style in self.styles(in_use_only=False):
+                    key = norm_key(style["name"])
+                    counts[key] = counts.get(key, 0) + 1
+                self._name_counts = counts
+            return self._name_counts
 
-        Rule when a name is both a style and a family ("Ska", "Rock", "Pop"):
-        the **style wins**, because that is the specific intent, and a family is
-        asked for explicitly with ``family:Ska``. The picker's family chips use
-        that form, so there is no ambiguity in the UI.
+    def style_reference(self, style: Dict[str, Any]) -> str:
+        """The short name when unique, ``Family::Name`` when duplicated."""
+        name = str(style.get("name") or "")
+        family = str(style.get("family") or "")
+        if family and self._style_name_counts().get(norm_key(name), 0) > 1:
+            return f"{family}{STYLE_REF_SEPARATOR}{name}"
+        return name
+
+    def resolve(self, entries: Iterable[str]) -> Tuple[List[str], List[str]]:
+        """Turn names / aliases / ``family:Name`` / ``Family::Name`` into ids.
+
+        * ``family:Punk`` selects the whole family (family chips use this).
+        * ``Punk::Hardcore`` selects one style when the name exists in several
+          families.
+        * a bare ``Hardcore`` selects every style with that name; the picker
+          writes the qualified form for an individual duplicate row.
+        When a name is both a style and a family ("Ska", "Rock", "Pop"), the
+        style wins; ask for the family with ``family:Ska``.
         """
         ids: List[str] = []
         families: List[str] = []
-        by_key = {norm_key(style["name"]): style["id"]
-                  for style in self.styles(in_use_only=False)}
-        for style in self.styles(in_use_only=False):
+        styles = self.styles(in_use_only=False)
+        by_name: Dict[str, List[str]] = {}
+        by_alias: Dict[str, str] = {}
+        by_ref: Dict[Tuple[str, str], str] = {}
+        for style in styles:
+            name_key = norm_key(style["name"])
+            by_name.setdefault(name_key, []).append(style["id"])
+            family = str(style.get("family") or "")
+            if family:
+                by_ref[(norm_key(family), name_key)] = style["id"]
+        for style in styles:
             for alias in json.loads(style.get("aliases") or "[]"):
-                by_key.setdefault(norm_key(alias), style["id"])
+                by_alias.setdefault(norm_key(alias), style["id"])
         known = {norm_key(family["name"]): family["name"] for family in self.families()}
         for entry in entries or []:
             text = str(entry).strip()
@@ -291,7 +334,22 @@ class Catalog:
                 elif not name:
                     raise JellyfinError(f"Unknown family {family_form.group(1)!r}")
                 continue
-            style_id = by_key.get(norm_key(text))
+            reference = split_style_ref(text)
+            if reference is not None:
+                style_id = by_ref.get((norm_key(reference[0]), norm_key(reference[1])))
+                if style_id is None:
+                    raise JellyfinError(
+                        f"Unknown style {text!r} (expected an existing Family::Name)")
+                if style_id not in ids:
+                    ids.append(style_id)
+                continue
+            matches = by_name.get(norm_key(text))
+            if matches:
+                for style_id in matches:
+                    if style_id not in ids:
+                        ids.append(style_id)
+                continue
+            style_id = by_alias.get(norm_key(text))
             if style_id is not None:
                 if style_id not in ids:
                     ids.append(style_id)
@@ -307,10 +365,17 @@ class Catalog:
         return ids, families
 
     def aliases_for(self, name: str) -> List[str]:
-        """The aliases of one style (the picker shows them in its detail line)."""
+        """The aliases of the first style with this name (legacy helper)."""
         key = norm_key(name)
         for style in self.styles(in_use_only=False):
             if norm_key(style["name"]) == key:
+                return [str(alias) for alias in json.loads(style.get("aliases") or "[]")]
+        return []
+
+    def aliases_for_id(self, style_id: Any) -> List[str]:
+        """The aliases of one exact style (safe when a name is duplicated)."""
+        for style in self.styles(in_use_only=False):
+            if str(style["id"]) == str(style_id):
                 return [str(alias) for alias in json.loads(style.get("aliases") or "[]")]
         return []
 

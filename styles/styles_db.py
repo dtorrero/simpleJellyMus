@@ -38,7 +38,7 @@ STYLES_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = STYLES_DIR / "config.json"
 LOCAL_CONFIG_PATH = STYLES_DIR / "config.local.json"
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Sources are ranked: the higher number wins when two layers disagree about the
 # same (track, style) pair. A human override always wins; the raw file tag beats
@@ -137,8 +137,8 @@ CREATE INDEX IF NOT EXISTS ix_tracks_family     ON tracks(family);
 -- the canonical vocabulary
 -- --------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS styles (
-    id         TEXT PRIMARY KEY,        -- slug, e.g. symphonic-power-metal
-    name       TEXT NOT NULL,           -- Symphonic Power Metal
+    id         TEXT PRIMARY KEY,        -- stable id: legacy name slug or family--name
+    name       TEXT NOT NULL,           -- Symphonic Power Metal (unique per family)
     family     TEXT,                    -- Metal
     parent     TEXT,                    -- optional parent style id
     aliases    TEXT,                    -- JSON list of extra search strings
@@ -149,6 +149,9 @@ CREATE TABLE IF NOT EXISTS styles (
 );
 CREATE INDEX IF NOT EXISTS ix_styles_search ON styles(search_key);
 CREATE INDEX IF NOT EXISTS ix_styles_family ON styles(family);
+-- The same style name may exist in several families ("Hardcore" in Metal,
+-- Punk or Electronic), but never twice inside one family.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_styles_name_family ON styles(name, family);
 
 -- --------------------------------------------------------------------------
 -- many styles per song
@@ -310,6 +313,8 @@ def connect(path: Path, *, create: bool = True) -> sqlite3.Connection:
             (str(SCHEMA_VERSION),),
         )
         connection.commit()
+    else:
+        ensure_style_index(connection)
     return connection
 
 
@@ -385,6 +390,125 @@ def style_display(name: Any) -> str:
     return " ".join(words)
 
 
+STYLE_REF_SEPARATOR = "::"
+# Separator for the internal lookup key of a qualified reference. It can never
+# occur in normalised text, so "Punk::Hardcore" cannot collide with a real name.
+STYLE_REF_KEY_SEPARATOR = "\x1f"
+
+
+def style_ref_key(family: Any, name: Any) -> str:
+    """Internal lookup key for ``Family::Name`` (normalised, collision-free)."""
+    return f"{norm_key(family)}{STYLE_REF_KEY_SEPARATOR}{norm_key(name)}"
+
+
+def style_ref(family: Any, name: Any) -> str:
+    """The explicit reference for a name that exists in several families."""
+    family_text = str(family or "").strip()
+    name_text = str(name or "").strip()
+    if not family_text:
+        return name_text
+    return f"{family_text}{STYLE_REF_SEPARATOR}{name_text}"
+
+
+def parse_style_ref(text: Any) -> Optional[Tuple[str, str]]:
+    """Split ``Family::Name``; ``None`` means a plain name or family selector."""
+    raw = str(text or "").strip()
+    if STYLE_REF_SEPARATOR not in raw:
+        return None
+    family, name = raw.split(STYLE_REF_SEPARATOR, 1)
+    family, name = family.strip(), name.strip()
+    return (family, name) if family and name else None
+
+
+def style_pair_key(name: Any, family: Any) -> Tuple[str, str]:
+    """The uniqueness key: a style name is unique *within* a family."""
+    return norm_key(name), norm_key(family)
+
+
+def find_style(connection: sqlite3.Connection, name: str,
+               family: Optional[str] = None) -> Optional[sqlite3.Row]:
+    """Find a style by name, and by family when one is given.
+
+    Matching is normalised (case, accents, punctuation), so ``Hardcore`` and
+    ``hard-core`` cannot become two rows inside the same family.
+    """
+    key = norm_key(name)
+    wanted_family = norm_key(family)
+    same_name: List[sqlite3.Row] = []
+    for row in connection.execute(
+            "SELECT id, name, family, aliases FROM styles"):
+        if norm_key(row["name"]) != key:
+            continue
+        if norm_key(row["family"]) == wanted_family:
+            return row
+        same_name.append(row)
+    if family is not None:
+        # Adopt a legacy entry that had no family at all.
+        for row in same_name:
+            if not norm_key(row["family"]):
+                return row
+    elif len(same_name) == 1:
+        return same_name[0]
+    return None
+
+
+def new_style_id(connection: sqlite3.Connection, name: str,
+                 family: Optional[str]) -> str:
+    """A deterministic, family-qualified id for a newly added style."""
+    prefix = style_slug(family) if family else "other"
+    base = f"{prefix}--{style_slug(name)}"
+    candidate = base
+    counter = 2
+    while connection.execute("SELECT 1 FROM styles WHERE id=?",
+                             (candidate,)).fetchone() is not None:
+        candidate = f"{base}-{counter}"
+        counter += 1
+    return candidate
+
+
+def ensure_style_index(connection: sqlite3.Connection) -> None:
+    """Create the (name, family) guard on an existing dataset when possible."""
+    try:
+        connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_styles_name_family"
+            " ON styles(name, family)")
+        connection.commit()
+    except sqlite3.DatabaseError:
+        # A very old or damaged dataset may still contain duplicates; the
+        # application-level checks in upsert_style() keep working without it.
+        pass
+
+
+def set_style_aliases(connection: sqlite3.Connection, style_id: str,
+                      aliases: Iterable[str]) -> None:
+    """Replace the alias list of one style (used when an alias moves away)."""
+    cleaned: List[str] = []
+    for alias in aliases or []:
+        text = str(alias).strip()
+        if text and text not in cleaned:
+            cleaned.append(text)
+    connection.execute(
+        "UPDATE styles SET aliases=? WHERE id=?",
+        (json.dumps(cleaned) if cleaned else None, style_id),
+    )
+
+
+def remove_style_aliases(connection: sqlite3.Connection, style_id: str,
+                         aliases: Iterable[str]) -> int:
+    """Remove aliases from one style; return how many entries disappeared."""
+    row = connection.execute("SELECT aliases FROM styles WHERE id=?",
+                             (style_id,)).fetchone()
+    if row is None:
+        return 0
+    existing = json.loads(row["aliases"] or "[]")
+    remove = {norm_key(alias) for alias in aliases or [] if norm_key(alias)}
+    kept = [alias for alias in existing if norm_key(alias) not in remove]
+    if len(kept) == len(existing):
+        return 0
+    set_style_aliases(connection, style_id, kept)
+    return len(existing) - len(kept)
+
+
 # --------------------------------------------------------------------------- #
 # vocabulary
 # --------------------------------------------------------------------------- #
@@ -392,27 +516,35 @@ def style_display(name: Any) -> str:
 def upsert_style(connection: sqlite3.Connection, name: str, *, family: Optional[str] = None,
                  parent: Optional[str] = None, aliases: Optional[Iterable[str]] = None,
                  source: str = "seed") -> str:
-    """Create or update one canonical style and return its id."""
+    """Create or update one canonical style and return its id.
+
+    The identity of a style is ``(name, family)``: the same name may exist in
+    several families. Existing rows keep their legacy id; a newly created row
+    gets a deterministic ``family--name`` id so two same-named styles can never
+    collide.
+    """
     clean = style_display(name)
     if not clean:
         raise ValueError("a style needs a name")
-    slug = style_slug(clean)
+    family_name = style_display(family) if family else None
     alias_list: List[str] = []
     if aliases:
         for alias in aliases:
             text = str(alias).strip()
             if text and text.lower() != clean.lower() and text not in alias_list:
                 alias_list.append(text)
-    row = connection.execute(
-        "SELECT aliases, family, parent FROM styles WHERE id=?", (slug,)).fetchone()
+    row = find_style(connection, clean, family_name)
     if row is None:
+        style_id = new_style_id(connection, clean, family_name)
         connection.execute(
             "INSERT INTO styles(id, name, family, parent, aliases, search_key, source)"
             " VALUES(?,?,?,?,?,?,?)",
-            (slug, clean, family, parent, json.dumps(alias_list) if alias_list else None,
+            (style_id, clean, family_name, parent,
+             json.dumps(alias_list) if alias_list else None,
              norm_key(clean), source),
         )
-        return slug
+        return style_id
+    style_id = row["id"]
     # Merge: never lose an alias or a family that an earlier run discovered.
     merged = json.loads(row["aliases"] or "[]")
     for alias in alias_list:
@@ -421,9 +553,10 @@ def upsert_style(connection: sqlite3.Connection, name: str, *, family: Optional[
     connection.execute(
         "UPDATE styles SET name=?, family=COALESCE(?, family), parent=COALESCE(?, parent),"
         " aliases=?, search_key=? WHERE id=?",
-        (clean, family, parent, json.dumps(merged) if merged else None, norm_key(clean), slug),
+        (clean, family_name, parent, json.dumps(merged) if merged else None,
+         norm_key(clean), style_id),
     )
-    return slug
+    return style_id
 
 
 def style_names(connection: sqlite3.Connection) -> Dict[str, str]:
@@ -432,10 +565,21 @@ def style_names(connection: sqlite3.Connection) -> Dict[str, str]:
 
 
 def style_lookup(connection: sqlite3.Connection) -> Dict[str, str]:
-    """Map every normalised name and alias -> style id (for typed searches)."""
+    """Map names, aliases and ``Family::Name`` references to style ids.
+
+    Bare names are resolved in insertion order, so the first style of a
+    duplicated name stays the default for old callers. Aliases are added last
+    and can never shadow a real style name.
+    """
+    rows = list(connection.execute(
+        "SELECT id, name, family, search_key, aliases FROM styles ORDER BY rowid"))
     lookup: Dict[str, str] = {}
-    for row in connection.execute("SELECT id, name, search_key, aliases FROM styles"):
-        lookup[row["search_key"] or norm_key(row["name"])] = row["id"]
+    for row in rows:
+        lookup.setdefault(row["search_key"] or norm_key(row["name"]), row["id"])
+    for row in rows:
+        if row["family"]:
+            lookup.setdefault(style_ref_key(row["family"], row["name"]), row["id"])
+    for row in rows:
         for alias in json.loads(row["aliases"] or "[]"):
             key = norm_key(alias)
             if key:
@@ -637,6 +781,11 @@ def refresh_track_primary(connection: sqlite3.Connection) -> None:
 
 def rebuild_artist_rollup(connection: sqlite3.Connection) -> int:
     """Refresh the artist table from the tracks (styles, families, counts)."""
+    # Drop caches/roll-ups for artists whose last track has disappeared.
+    connection.execute(
+        "DELETE FROM artists WHERE key NOT IN ("
+        " SELECT DISTINCT artist_key FROM tracks"
+        " WHERE artist_key IS NOT NULL AND artist_key <> '')")
     connection.execute(
         "INSERT INTO artists(key, name, tracks, albums, updated_at)"
         " SELECT artist_key, MIN(album_artist), COUNT(*), COUNT(DISTINCT album_key), ?"

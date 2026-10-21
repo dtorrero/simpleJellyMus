@@ -759,8 +759,13 @@ def cmd_fill(config: Dict[str, Any], args: argparse.Namespace,
            f" WHERE (primary_style IS NULL OR {S.FAMILY_STYLE_SQL} OR {S.VAGUE_STYLE_SQL})")
     params: List[Any] = []
     if args.style:
+        style_id = normalizer.resolve_name(args.style)
+        if style_id is None:
+            S.log(f"unknown style {args.style!r} "
+                  "(use Family::Name when a name exists in several families)")
+            return 2
         sql += " AND primary_style = ?"
-        params.append(S.style_slug(args.style))
+        params.append(style_id)
     if args.limit:
         sql += " LIMIT ?"
         params.append(int(args.limit))

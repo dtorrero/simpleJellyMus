@@ -170,6 +170,7 @@ python3 main.py --login          # force the login screen
 python3 main.py --reset-login    # forget the saved login and exit
 python3 main.py --debug          # verbose Jellyfin + mpv logging
 python3 main.py --style "Ska Punk"                     # only that style
+python3 main.py --style "Punk::Hardcore"                # one exact Hardcore style
 python3 main.py --style "Black Metal" --style "Ska Punk"  # either of the two
 python3 main.py --style "family:Metal"                 # a whole family
 python3 main.py --style "Ska Punk" --style-mode all    # both at once
@@ -187,6 +188,7 @@ fuzzily, aliases and small typos included, and the catalog is opened
 | `--style` accepts | Example |
 |---|---|
 | a style name | `--style "Ska Punk"` |
+| a style in a specific family | `--style "Punk::Hardcore"` (needed when the same name exists in several families; a bare `Hardcore` selects all of them) |
 | an alias | `--style "outrun"` → Synthwave |
 | a family | `--style "family:Metal"` (a style with the same name wins: `--style Metal` is the style, `family:Metal` the family) |
 
@@ -227,11 +229,14 @@ If a style is missing or wrong, the optional review tool can fix it by hand:
 python3 styles/review_gui.py
 ```
 
-It lists the unlabelled or low-confidence tracks, previews them through mpv,
-saves a `human`/manual override, and can add a missing style (family,
-sub-style, aliases) to the vocabulary (see `styles/README.md`). It is a separate
-tool; the player itself still opens the catalog read-only. The review tool is
-new and not fully tested against every library — start with a small queue.
+It lists the unlabelled or low-confidence tracks, plays them through mpv with a
+play/pause button, a volume slider and a seekable progress bar, saves a
+`human`/manual override,
+and can add a missing style (family, sub-style, aliases) to the vocabulary. Its
+**Remove missing…** action also drops catalog rows whose files you deleted (see
+`styles/README.md`). It is a separate tool; the player itself still opens the
+catalog read-only. The review tool is new and not fully tested against every
+library — start with a small queue.
 
 The app starts **windowed** (remembering the size and fullscreen/windowed mode
 you used last time) and `Esc` switches between windowed and fullscreen.

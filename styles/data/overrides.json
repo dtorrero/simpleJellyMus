@@ -259,6 +259,55 @@
       ],
       "exclusive": true,
       "note": "review GUI"
+    },
+    "Falling Into Place": {
+      "styles": [
+        "Pop Punk"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Galya Bisengalieva": {
+      "styles": [
+        "Classical"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Judo CHOP!": {
+      "styles": [
+        "Skate Punk"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Kelle": {
+      "styles": [
+        "Psy-Trance"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Kelle & Juha": {
+      "styles": [
+        "Electronic"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Lacerated Enemy records": {
+      "styles": [
+        "Technical Death Metal Brutal"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Mare Salutis": {
+      "styles": [
+        "Neo-Classical Metal"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
     }
   },
   "albums": {
@@ -310,7 +359,124 @@
       ],
       "exclusive": true,
       "note": "review GUI"
+    },
+    "Kelle & Avada Kedavra :: [FREE DOWNLOAD] Nucleosynthesis / incl. Beatman & Ludmilla Psybreaks Edit": {
+      "styles": [
+        "Psy-Trance"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Kelle feat. Yana Tereshcenko :: New Me": {
+      "styles": [
+        "Electro House"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Kelle x Juskowiak :: Run EP": {
+      "styles": [
+        "Synthwave"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Kelle, Juha :: [Synthwave] Figures in Fog": {
+      "styles": [
+        "Synthwave"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Kelle, John Dopping :: Join the Underworld": {
+      "styles": [
+        "Psy-Trance"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "ListenableRecords :: ListenableRecords": {
+      "styles": [
+        "Various"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Meat Crayon :: Locked In": {
+      "styles": [
+        "Nu Metal"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
     }
   },
-  "tracks": {}
+  "tracks": {
+    "Flowersforpersephone/2026 - High Heel Complex (EP)/06 Ligh heel complex.mp3": {
+      "styles": [],
+      "exclusive": true,
+      "note": "marked unknown in review GUI"
+    },
+    "Flowersforpersephone/2025 - A Temporary Stay (EP)/01 Bloodstane on the hi-way.mp3": {
+      "styles": [],
+      "exclusive": true,
+      "note": "marked unknown in review GUI"
+    },
+    "Flowersforpersephone/2025 - A Temporary Stay (EP)/02 Comparison is the if of joy.mp3": {
+      "styles": [],
+      "exclusive": true,
+      "note": "marked unknown in review GUI"
+    },
+    "Flowersforpersephone/2025 - A Temporary Stay (EP)/03 Put on your big girl panties and deal with it!.mp3": {
+      "styles": [],
+      "exclusive": true,
+      "note": "marked unknown in review GUI"
+    },
+    "Flowersforpersephone/2025 - A Temporary Stay (EP)/04 My tombstone will be my degree.mp3": {
+      "styles": [],
+      "exclusive": true,
+      "note": "marked unknown in review GUI"
+    },
+    "Flowersforpersephone/2025 - Blessyrsweetlittleheart! (EP)/01 Fitzpatrick.mp3": {
+      "styles": [],
+      "exclusive": true,
+      "note": "marked unknown in review GUI"
+    },
+    "Flowersforpersephone/2025 - Blessyrsweetlittleheart! (EP)/02 Your parents should've sent you to catholic school.mp3": {
+      "styles": [],
+      "exclusive": true,
+      "note": "marked unknown in review GUI"
+    },
+    "Flowersforpersephone/2025 - Blessyrsweetlittleheart! (EP)/03 Blessyrsweetlittleheart!.mp3": {
+      "styles": [],
+      "exclusive": true,
+      "note": "marked unknown in review GUI"
+    },
+    "Flowersforpersephone/2026 - High Heel Complex (EP)/01 All my hopes and dreams are just that hopes and dreams.mp3": {
+      "styles": [],
+      "exclusive": true,
+      "note": "marked unknown in review GUI"
+    },
+    "Flowersforpersephone/2026 - High Heel Complex (EP)/02 Local pizza champions.mp3": {
+      "styles": [],
+      "exclusive": true,
+      "note": "marked unknown in review GUI"
+    },
+    "Flowersforpersephone/2026 - High Heel Complex (EP)/03 If i had a nickel for every person alive i would have 8 billion nickels.mp3": {
+      "styles": [
+        "Synthwave"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Flowersforpersephone/2026 - High Heel Complex (EP)/04 Ring ring!.mp3": {
+      "styles": [],
+      "exclusive": true,
+      "note": "marked unknown in review GUI"
+    },
+    "Flowersforpersephone/2026 - High Heel Complex (EP)/05 Is my scroll foretold.mp3": {
+      "styles": [],
+      "exclusive": true,
+      "note": "marked unknown in review GUI"
+    }
+  }
 }

@@ -34,7 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import styles_db as S  # noqa: E402
 from step3_vocabulary import (load_rules, load_vocabulary, normalize_raw,  # noqa: E402
-                              split_parts, vocabulary_keys, styles_file)
+                              split_parts)
 
 MAX_REPLACE_PASSES = 4
 FUZZY_CUTOFF = 0.88
@@ -54,16 +54,58 @@ class Normalizer:
             row["id"]: (row["family"] or "")
             for row in connection.execute("SELECT id, family FROM styles")
         }
+        rows = list(connection.execute(
+            "SELECT id, name, family, search_key, aliases FROM styles ORDER BY rowid"))
+        by_pair = {S.style_pair_key(row["name"], row["family"]): row["id"]
+                   for row in rows}
+        # Explicit ``Family::Name`` references (overrides, rules, CLI).
+        self.qualified_keys: Dict[str, str] = {}
+        for row in rows:
+            if row["family"]:
+                self.qualified_keys[S.style_ref_key(row["family"], row["name"])] = row["id"]
+
+        vocab_entries: List[Tuple[str, str, Dict[str, Any]]] = []
+        for entry in self.vocabulary.get("styles") or []:
+            name = str(entry.get("name") or "").strip()
+            if not name:
+                continue
+            family = str(entry.get("family") or "").strip()
+            vocab_entries.append((name, family, entry))
+
         self.keys: Dict[str, str] = {}
-        for row in connection.execute("SELECT id, name, search_key, aliases FROM styles"):
-            self.keys[row["search_key"] or normalize_raw(row["name"])] = row["id"]
+        missing: List[str] = []
+        # Names first, in vocabulary-file order: the first duplicate is the
+        # default for a bare tag; an exact name always beats an alias.
+        for name, family, _entry in vocab_entries:
+            style_id = by_pair.get(S.style_pair_key(name, family))
+            if style_id is None:
+                row = S.find_style(connection, name, family)
+                style_id = row["id"] if row is not None else None
+            if style_id is None:
+                missing.append(f"{name!r} ({family or 'no family'})")
+                continue
+            self.keys.setdefault(normalize_raw(name), style_id)
+        # Styles created by the pipeline but absent from the vocabulary.
+        for row in rows:
+            self.keys.setdefault(row["search_key"] or normalize_raw(row["name"]), row["id"])
+        # Aliases last.
+        for name, family, entry in vocab_entries:
+            style_id = by_pair.get(S.style_pair_key(name, family))
+            if style_id is None:
+                continue
+            for alias in (entry.get("aliases") or []):
+                key = normalize_raw(str(alias))
+                if key:
+                    self.keys.setdefault(key, style_id)
+        for row in rows:
             for alias in json.loads(row["aliases"] or "[]"):
                 key = normalize_raw(alias)
                 if key:
                     self.keys.setdefault(key, row["id"])
-        # The vocabulary file is the source of truth; the table can lag behind it.
-        for key, name in vocabulary_keys(self.vocabulary).items():
-            self.keys.setdefault(key, S.style_slug(name))
+        if missing:
+            raise SystemExit(
+                "vocabulary styles are missing from the dataset: " + ", ".join(missing)
+                + "\nrun:  python3 step3_vocabulary.py --build")
 
         self.family_names: Dict[str, str] = {
             normalize_raw(name): str(name) for name in (self.vocabulary.get("families") or [])
@@ -105,6 +147,14 @@ class Normalizer:
         self.style_families[style_id] = family
         self._family_styles[family] = style_id
         return style_id
+
+    def resolve_name(self, name: Any) -> Optional[str]:
+        """Resolve a style name or an explicit ``Family::Name`` reference."""
+        text = str(name or "").strip()
+        parsed = S.parse_style_ref(text)
+        if parsed is not None:
+            return self.qualified_keys.get(S.style_ref_key(*parsed))
+        return self.keys.get(normalize_raw(text))
 
     def clean_piece(self, piece: str) -> str:
         """Normalise one piece: strip regexes, translate, drop filler words."""
@@ -187,7 +237,9 @@ class Normalizer:
         if whole in self.force:
             entries = []
             for name in self.force[whole]:
-                style_id = self.keys.get(normalize_raw(name)) or S.style_slug(name)
+                style_id = self.resolve_name(name)
+                if style_id is None:
+                    continue
                 entries.append((style_id, 1.0, "rules", 0.8, f"forced:{whole}"))
             return entries[:self.max_styles], "forced", []
 
@@ -214,8 +266,8 @@ class Normalizer:
             expanded = self.expand.get(key)
             if expanded:
                 for name in expanded:
-                    style_id = self.keys.get(normalize_raw(name)) or S.style_slug(name)
-                    if style_id in seen:
+                    style_id = self.resolve_name(name)
+                    if style_id is None or style_id in seen:
                         continue
                     seen.add(style_id)
                     weight = 1.0 if not entries else 0.7
@@ -272,8 +324,7 @@ def _resolve_names(normalizer: Normalizer, names: Iterable[str],
                    errors: List[str], where: str) -> List[str]:
     resolved = []
     for name in names or []:
-        key = normalize_raw(name)
-        style_id = normalizer.keys.get(key)
+        style_id = normalizer.resolve_name(name)
         if style_id is None:
             errors.append(f"{where}: unknown style {name!r}")
             continue

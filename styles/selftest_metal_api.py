@@ -22,6 +22,7 @@ sys.path.insert(0, str(STYLES_DIR))
 
 import step6_metal_api as M  # noqa: E402
 import styles_db as S  # noqa: E402
+from step3_vocabulary import build, load_vocabulary  # noqa: E402
 
 TMP = Path(tempfile.mkdtemp(prefix="simplejellymus-metal-api-"))
 
@@ -187,6 +188,8 @@ def build_catalog(config: Dict[str, Any]) -> None:
               "Unmapped Album", 1)
     add_track(connection, "Known Other/Other Album/01.mp3", "Rock Song", "Known Other",
               "Other Album", 1, raw_genre="Rock", primary="rock", family="Rock")
+    # Normalizer requires every vocabulary style to exist in the dataset.
+    build(connection, load_vocabulary(config))
     connection.commit()
     connection.close()
     Path(config["music_root"]).mkdir(parents=True, exist_ok=True)

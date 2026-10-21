@@ -1557,6 +1557,8 @@ class StylePicker(tk.Frame):
                 name = str(result["name"])
                 if result.get("kind") == "family":
                     name = f"{name}  (whole family)"
+                elif self.catalog.style_reference(result) != name:
+                    name = f"{name} · {result.get('family')}"
                 self._list.insert("end", f"  {name}   ({int(result.get('tracks') or 0):,})")
         finally:
             self._updating = False
@@ -1633,7 +1635,7 @@ class StylePicker(tk.Frame):
         result = self._results[index]
         if result.get("kind") == "family":
             return f"family:{result['name']}"
-        return str(result["name"])
+        return self.catalog.style_reference(result)
 
     def _is_selected(self, entry: str) -> bool:
         if not entry:
@@ -1686,7 +1688,7 @@ class StylePicker(tk.Frame):
             parts.append(f"family {result['family']}")
         parts.append(f"{int(result.get('tracks') or 0):,} tracks")
         try:
-            aliases = self.catalog.aliases_for(str(result["name"]))
+            aliases = self.catalog.aliases_for_id(result.get("id"))
         except Exception:                 # a damaged row must not break the panel
             aliases = []
         if aliases:

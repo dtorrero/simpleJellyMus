@@ -60,57 +60,103 @@ def split_parts(raw: str) -> List[str]:
 
 
 def validate(vocabulary: Dict[str, Any]) -> Tuple[List[str], List[str]]:
-    """Return (errors, warnings) for the vocabulary file."""
+    """Return (errors, warnings) for the vocabulary file.
+
+    A name is unique *within its family*: ``Hardcore`` may exist in Metal, Punk
+    and Electronic, but not twice in one family. Aliases stay globally unique,
+    so a bare tag can never become ambiguous.
+    """
     errors: List[str] = []
     warnings: List[str] = []
     families = {str(name).strip() for name in (vocabulary.get("families") or [])}
-    seen_ids: Dict[str, str] = {}
-    seen_keys: Dict[str, str] = {}
+    family_keys = {S.norm_key(name): str(name) for name in families}
+    seen_pairs: Dict[Tuple[str, str], str] = {}
+    name_owners: Dict[str, List[str]] = defaultdict(list)
+    alias_owners: Dict[str, str] = {}
+    entries: List[Tuple[str, str, Dict[str, Any]]] = []
+
     for entry in vocabulary["styles"]:
         name = str(entry.get("name") or "").strip()
         if not name:
             errors.append("a style entry has no name")
             continue
-        slug = S.style_slug(name)
-        if slug in seen_ids:
-            errors.append(f"duplicate style: {name!r} and {seen_ids[slug]!r} share the id {slug}")
-        seen_ids[slug] = name
-        family = entry.get("family")
-        if family and families and family not in families:
+        family = str(entry.get("family") or "").strip()
+        if S.STYLE_REF_SEPARATOR in name or S.STYLE_REF_SEPARATOR in family:
+            errors.append(
+                f"{name!r}: names and families cannot contain {S.STYLE_REF_SEPARATOR!r}")
+        label = f"{name!r} ({family or 'no family'})"
+        pair = S.style_pair_key(name, family)
+        if pair in seen_pairs:
+            errors.append(
+                f"duplicate style: {label} and {seen_pairs[pair]} are the same name "
+                f"in the same family")
+        seen_pairs[pair] = label
+        entries.append((name, family, entry))
+        name_owners[S.norm_key(name)].append(label)
+        if family and families and S.norm_key(family) not in family_keys:
             warnings.append(f"{name!r}: family {family!r} is not in the families list")
         if not family:
             warnings.append(f"{name!r}: no family")
-        keys = [S.norm_key(name)] + [S.norm_key(alias) for alias in (entry.get("aliases") or [])]
-        for key in keys:
-            if not key:
+
+    for name, _family, entry in entries:
+        own_key = S.norm_key(name)
+        for alias in (entry.get("aliases") or []):
+            key = S.norm_key(alias)
+            if not key or key == own_key:
                 continue
-            if key in seen_keys and seen_keys[key] != name:
+            if key in name_owners:
                 warnings.append(
-                    f"alias {key!r} is used by both {seen_keys[key]!r} and {name!r}")
-            seen_keys.setdefault(key, name)
-    for entry in vocabulary["styles"]:
-        parent = entry.get("parent")
-        if parent and S.style_slug(parent) not in seen_ids:
-            warnings.append(f"{entry.get('name')!r}: parent {parent!r} does not exist")
+                    f"alias {alias!r} of {name!r} is already a style name "
+                    f"({', '.join(name_owners[key])})")
+            owner = alias_owners.get(key)
+            if owner and owner != name:
+                warnings.append(
+                    f"alias {alias!r} is used by both {owner!r} and {name!r}")
+            alias_owners.setdefault(key, name)
+
+    for name, family, entry in entries:
+        parent = str(entry.get("parent") or "").strip()
+        if not parent:
+            continue
+        if S.STYLE_REF_SEPARATOR in parent:
+            errors.append(f"{name!r}: a parent is a plain style name, not a reference")
+            continue
+        if S.style_pair_key(parent, family) not in seen_pairs:
+            warnings.append(
+                f"{name!r}: parent {parent!r} does not exist in the "
+                f"{family or 'same'} family")
+        if S.norm_key(parent) == S.norm_key(name):
+            warnings.append(f"{name!r}: a style cannot be its own parent")
     return errors, warnings
 
 
 def build(connection, vocabulary: Dict[str, Any]) -> int:
-    """Load the vocabulary into the dataset (idempotent)."""
-    total = 0
+    """Load the vocabulary into the dataset (idempotent).
+
+    Two passes: all styles first, then their parents. A parent is resolved by
+    ``(family, name)`` because the same name may exist in another family.
+    """
+    S.ensure_style_index(connection)
+    loaded: List[Tuple[str, Optional[str], Optional[str]]] = []
     for entry in vocabulary["styles"]:
         name = str(entry.get("name") or "").strip()
         if not name:
             continue
+        family = str(entry.get("family") or "").strip() or None
         S.upsert_style(
-            connection, name,
-            family=(str(entry.get("family")) if entry.get("family") else None),
-            parent=(S.style_slug(entry["parent"]) if entry.get("parent") else None),
-            aliases=entry.get("aliases") or [],
-            source="seed",
-        )
-        total += 1
-    return total
+            connection, name, family=family,
+            aliases=entry.get("aliases") or [], source="seed")
+        loaded.append((name, family, str(entry.get("parent") or "").strip() or None))
+    for name, family, parent in loaded:
+        row = S.find_style(connection, name, family)
+        if row is None:
+            continue
+        parent_row = S.find_style(connection, parent, family) if parent else None
+        parent_id = parent_row["id"] if parent_row is not None else None
+        if parent_id == row["id"]:
+            parent_id = None
+        connection.execute("UPDATE styles SET parent=? WHERE id=?", (parent_id, row["id"]))
+    return len(loaded)
 
 
 def normalize_raw(value: str) -> str:
@@ -121,18 +167,29 @@ def normalize_raw(value: str) -> str:
     return " ".join(text.split())
 
 
-def vocabulary_keys(vocabulary: Dict[str, Any]) -> Dict[str, str]:
-    """Map every normalised name/alias -> style name."""
-    keys: Dict[str, str] = {}
+def vocabulary_keys(vocabulary: Dict[str, Any]) -> Dict[str, Tuple[str, str]]:
+    """Map every normalised name/alias -> ``(name, family)``.
+
+    All style **names** are registered first, then the aliases. An exact name
+    therefore always beats an alias of another style ("Progressive Deathcore"
+    wins over Deathcore's old ``progressive deathcore`` alias). For a duplicated
+    name the first entry in the file stays the default.
+    """
+    entries: List[Tuple[str, str, Dict[str, Any]]] = []
     for entry in vocabulary["styles"]:
         name = str(entry.get("name") or "").strip()
         if not name:
             continue
-        keys.setdefault(normalize_raw(name), name)
+        family = str(entry.get("family") or "").strip()
+        entries.append((name, family, entry))
+    keys: Dict[str, Tuple[str, str]] = {}
+    for name, family, _entry in entries:
+        keys.setdefault(normalize_raw(name), (name, family))
+    for name, family, entry in entries:
         for alias in (entry.get("aliases") or []):
             key = normalize_raw(str(alias))
             if key:
-                keys.setdefault(key, name)
+                keys.setdefault(key, (name, family))
     return keys
 
 

@@ -160,9 +160,10 @@ python3 review_gui.py
 ```
 
 It lists the tracks in a queue (`No style`, `No genre tag`, `Vague / family
-only`, `Review queue (CSV)` or `All tracks`), plays a 60-second preview through
-mpv, and lets you type in the style box to find a style instantly. The first
-match is highlighted; Enter selects it.
+only`, `Review queue (CSV)` or `All tracks`), plays the whole track through mpv
+with one play/pause button and a progress bar (click the bar to seek), and lets
+you type in the style box to find a style instantly. The first match is
+highlighted; Enter selects it.
 
 ### Adding a style the pipeline did not produce
 
@@ -176,6 +177,16 @@ next to the style box. The form uses the same vocabulary format as
 | **Style name** | the canonical label the player shows (`name` in `styles.json`) |
 | **Sub-style of** | optional `parent`, a style of the same family (the finer hierarchy) |
 | **Aliases** | comma-separated spellings/misspellings from file tags |
+
+A style name is unique **inside its family**, not globally. `Hardcore` can exist
+under `Hardcore`, `Punk` and `Metal` at the same time; the two rows keep the
+same display name and are distinguished by their family. If the name you type is
+currently an alias of another style (for example `Progressive Deathcore` is an
+alias of `Deathcore`), the form asks whether to move that spelling to the new
+style; on confirmation the alias is removed from the old style in both
+`styles.json` and the catalog. After promoting an alias, run
+`python3 step4_normalize.py` and `python3 step9_consensus.py` so existing raw
+tags such as `progressive deathcore` are remapped to the new style.
 
 Adding writes the entry in two places: it appends one line to
 `data/styles.json` (with a timestamped backup in `out/`) and immediately upserts
@@ -204,6 +215,16 @@ restart it to see the new label. No music file and no Jellyfin data is touched.
 
 Useful details:
 
+* **▶ Play / Pause** plays the full track; the progress bar shows the position
+  and duration and can be clicked to seek. The **Volume** slider controls mpv
+  live (and is kept for the next track in the session). `F5` toggles playback,
+  `Esc` stops it.
+* **Remove missing…** (left panel) checks every catalog track against
+  `music_root`, shows the rows whose file no longer exists, and deletes only
+  those rows and their labels after confirmation. It refuses to run when no
+  file is visible, so an unmounted library cannot empty the catalog. Nothing on
+  disk is modified. The same cleanup is available headless as
+  `python3 step1_scan.py --prune`.
 * **New style…** (`Ctrl+N`) writes a missing style to `data/styles.json` **and**
   the catalog in one go (family, optional sub-style parent and aliases).
 * **Save to track / album / artist** buttons show how many tracks they affect.
@@ -238,7 +259,7 @@ have several styles:
 |---|---|
 | `tracks` | one row per song: path, tags, title/album/artist/year/duration, the verbatim `raw_genre`, the Jellyfin `id` + cover tags, and the denormalised `primary_style` / `family` / `label_source` |
 | `track_styles` | every style of a track: `weight` (1.0 = main, lower = secondary), `source`, `confidence`, `evidence` |
-| `styles` | the vocabulary: `id`, `name`, `family`, `parent`, `aliases`, and materialised `tracks`/`artists` counts |
+| `styles` | the vocabulary: `id`, `name`, `family` (a name is unique per family), `parent`, `aliases`, and materialised `tracks`/`artists` counts |
 | `raw_genres` | audit trail: each raw tag, how many tracks use it, what it became, what is still ununderstood |
 | `artists` | artist roll-up + cache for the Wikidata/MusicBrainz/LLM answers (so nothing is ever asked twice) |
 | `api_calls` | token/cost accounting for the LLM step |
@@ -385,6 +406,32 @@ fallbacks). Both are plain text, versioned in git, and yours to edit. The review
 GUI's **New style…** button appends one entry to `data/styles.json` for you and
 loads it into the catalog, so hand-editing is only needed for bulk changes.
 
+A style is identified by **`(name, family)`**, not by its name alone:
+
+* `Hardcore` may exist under `Hardcore`, `Punk` and `Metal`; adding it twice in
+  the same family is rejected.
+* Existing rows keep their legacy `name-slug` id. New rows get a deterministic
+  `family--name` id (`punk--hardcore`), so a new duplicate can never overwrite an
+  existing style. A `UNIQUE(name, family)` index protects the pair.
+* Aliases stay globally unique, and an exact style name always wins over an
+  alias. Promoting an alias to its own style therefore works; the GUI moves the
+  spelling off the old style.
+* A `parent` (sub-style) is a plain name in the same family; it is stored as the
+  parent's actual id.
+
+When a name exists in several families, select one explicitly with
+**`Family::Name`**:
+
+```text
+Punk::Hardcore      the Hardcore style in the Punk family
+Metal::Hardcore     the Hardcore style in the Metal family
+```
+
+A bare `Hardcore` keeps the first entry in `styles.json` as the default for raw
+tags and old overrides. The player's interactive selection treats a bare name as
+*all* variants; the review GUI writes the qualified form automatically when you
+save a duplicate. `family:Punk` still means the whole family.
+
 ```bash
 python3 step3_vocabulary.py --uncovered   # what the vocabulary does not know yet
 #   -> out/uncovered_parts.txt, sorted by how many tracks it affects
@@ -393,8 +440,9 @@ python3 step3_vocabulary.py --all && python3 step4_normalize.py
 ```
 
 `data/overrides.json` always wins over every automatic layer - per artist, per
-album (`"Artist :: Album"`) or per file path. An empty style list means "no
-style at all", so the track is never picked by a style filter. Add
+album (`"Artist :: Album"`) or per file path. A style entry is a plain name, or
+`Family::Name` when the same name exists in several families. An empty style
+list means "no style at all", so the track is never picked by a style filter. Add
 `"exclusive": true` to an override to turn it into a lock: every automatic
 label of the matched tracks is removed, so only your `styles` list remains.
 The lock is re-applied by every `step4_normalize.py` run, and the artist
@@ -412,6 +460,7 @@ for random songs.
 
 ```bash
 python3 main.py --style "Ska Punk"                # from the command line
+python3 main.py --style "Punk::Hardcore"          # one of several Hardcore styles
 python3 main.py --style "family:Metal" --style-mode any
 ```
 
@@ -427,6 +476,8 @@ LLM, no extra network - only the database file.
 | many tracks `without_id` after step 2 | run `python3 step2_link.py --detect-only`: it prints the server path next to a local one. Jellyfin usually reports the path **inside its container** (`/musicMedia/...`), not the one you mounted (`/mnt/...`) - set `jellyfin.path_prefix` accordingly |
 | `no API key` from step 5 | `echo 'DEEPSEEK_API_KEY=...' > styles/.env` (git-ignored) |
 | step 5 says "REFUSING to run" | the projection is over the budget: raise `--max-cost` or `llm.max_cost_usd` |
+| `vocabulary styles are missing from the dataset` | run `python3 step3_vocabulary.py --build` (the vocabulary file is ahead of the catalog) |
+| deleted files still appear in the review GUI | press **Remove missing…** in the review GUI, or run `python3 step1_scan.py --prune` (it never prunes an empty/unmounted music root) |
 | `missing model files` | `python3 step7_classify.py --setup` |
 | the classifier cannot start | `python3 step7_classify.py --check` - it prints the real error |
 | a style shows fewer tracks than expected | check `out/normalize_report.txt` and `out/uncovered_parts.txt` |

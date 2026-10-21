@@ -547,6 +547,7 @@ def parse_args(argv):
     parser.add_argument("--debug", action="store_true", help="verbose Jellyfin/mpv logging")
     parser.add_argument("--style", action="append", default=[], metavar="STYLE",
                         help="only play this style (repeatable, e.g. --style \"Black Metal\";"
+                             " \"Family::Name\" picks one of several same-named styles;"
                              " \"family:Metal\" selects a whole family)")
     parser.add_argument("--style-mode", default="", choices=["", "any", "all", "not"],
                         help="how several styles combine: any (default), all, not")

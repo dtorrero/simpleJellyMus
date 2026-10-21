@@ -14,6 +14,10 @@ The tool can also add a **new canonical style** to ``data/styles.json`` (name,
 family, optional parent/sub-style and aliases) and load it into the catalog
 immediately, so a style the automatic pipeline never saw can be used at once.
 
+The selected track is played in full through mpv: one play/pause button, a
+volume slider and a progress bar (click to seek) replace the old fixed-length
+preview.
+
     python3 styles/review_gui.py
     python3 styles/review_gui.py --list no_style --limit 20
     python3 styles/review_gui.py --db /tmp/catalog.sqlite
@@ -27,8 +31,8 @@ import json
 import os
 import re
 import shutil
-import subprocess
 import sys
+import threading
 import time
 import tkinter as tk
 from pathlib import Path
@@ -41,6 +45,7 @@ sys.path.insert(0, str(STYLES_DIR))
 sys.path.insert(0, str(ROOT))
 
 import styles_db as S  # noqa: E402
+from player import MpvPlayer  # noqa: E402
 from step3_vocabulary import normalize_raw  # noqa: E402
 from step4_normalize import Normalizer, apply_overrides  # noqa: E402
 
@@ -302,13 +307,6 @@ class VocabularyStore:
         keys = [S.norm_key(text), normalize_raw(str(text or ""))]
         return list(dict.fromkeys(key for key in keys if key))
 
-    @classmethod
-    def _keys(cls, entry: Dict[str, Any]) -> List[str]:
-        keys = cls._alias_keys(entry.get("name"))
-        for alias in (entry.get("aliases") or []):
-            keys.extend(cls._alias_keys(alias))
-        return list(dict.fromkeys(keys))
-
     def _backup(self) -> Optional[Path]:
         if not self.path.exists():
             return None
@@ -327,14 +325,47 @@ class VocabularyStore:
         tmp.write_text(dump_vocabulary(data), encoding="utf-8")
         os.replace(tmp, self.path)
 
+    def _matching_aliases(self, data: Dict[str, Any], name: str, *,
+                          remove: bool) -> List[Tuple[str, str, str]]:
+        """Aliases of other styles that spell *name* exactly (normalised)."""
+        keys = set(self._alias_keys(name))
+        matches: List[Tuple[str, str, str]] = []
+        for entry in data.get("styles") or []:
+            aliases = list(entry.get("aliases") or [])
+            own_keys = set(self._alias_keys(entry.get("name")))
+            kept: List[str] = []
+            for alias in aliases:
+                alias_keys = set(self._alias_keys(alias))
+                # Never "move" an entry's own name listed as an alias.
+                if alias_keys & keys and not alias_keys & own_keys:
+                    matches.append((str(entry.get("name") or ""),
+                                    str(entry.get("family") or ""),
+                                    str(alias)))
+                    continue
+                kept.append(alias)
+            if remove and len(kept) != len(aliases):
+                entry["aliases"] = kept
+        return matches
+
+    def alias_moves(self, name: str) -> List[Tuple[str, str, str]]:
+        """What adding *name* would move off another style (for confirmation)."""
+        try:
+            data = self.load()
+        except ValueError:
+            return []
+        return self._matching_aliases(data, name, remove=False)
+
     def add(self, name: str, family: str, *, parent: str = "",
             aliases: Sequence[str] = (),
-            reserved: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
-        """Append one style in the documented format and return its entry.
+            reserved_names: Optional[Dict[Tuple[str, str], str]] = None
+            ) -> Tuple[Dict[str, Any], List[Tuple[str, str, str]]]:
+        """Append one style and return ``(entry, moved_aliases)``.
 
-        ``reserved`` maps normalised names/aliases to a human description for
-        entries that exist only in the catalog (for example the automatic
-        ``Metal (unspecified)`` placeholders), so they cannot be duplicated.
+        A name is unique within its family; the same name in another family is
+        allowed. If the new name is currently an alias of another style, that
+        alias is moved to the new style. ``reserved_names`` maps
+        ``(normalised family, normalised name)`` to catalog-only entries (the
+        automatic ``(unspecified)`` placeholders).
         """
         data = self.load()
         clean = S.style_display(name)
@@ -343,6 +374,9 @@ class VocabularyStore:
         clean_family = S.style_display(family)
         if not clean_family:
             raise ValueError("Choose a family for the style.")
+        if S.STYLE_REF_SEPARATOR in clean or S.STYLE_REF_SEPARATOR in clean_family:
+            raise ValueError(
+                f"Names and families cannot contain {S.STYLE_REF_SEPARATOR!r}.")
 
         family_name = clean_family
         new_family = True
@@ -352,75 +386,80 @@ class VocabularyStore:
                 new_family = False
                 break
 
+        pair = S.style_pair_key(clean, family_name)
+        for entry in data["styles"]:
+            if S.style_pair_key(entry.get("name"), entry.get("family")) == pair:
+                raise ValueError(
+                    f"A style named {entry.get('name')!r} already exists in "
+                    f"the {family_name!r} family.")
+
         parent_name = ""
         wanted_parent = S.norm_key(parent)
         if wanted_parent:
             for entry in data["styles"]:
                 if S.norm_key(entry.get("name")) != wanted_parent:
                     continue
+                if S.norm_key(entry.get("family")) != S.norm_key(family_name):
+                    continue
                 parent_name = str(entry.get("name"))
-                parent_family = S.norm_key(entry.get("family"))
-                if parent_family and parent_family != S.norm_key(family_name):
-                    raise ValueError(
-                        f"Parent style {parent_name!r} is in the "
-                        f"{entry.get('family')!r} family, not {family_name!r}.")
                 break
             if not parent_name:
                 raise ValueError(
-                    f"Parent style {parent!r} is not in {self.path.name}. "
-                    "Run step3_vocabulary.py --build first.")
+                    f"Parent style {parent!r} does not exist in the "
+                    f"{family_name!r} family.")
             if S.norm_key(parent_name) == S.norm_key(clean):
                 raise ValueError("A style cannot be its own sub-style.")
+
+        # A style name wins over an alias: move the spelling to the new style.
+        moved = self._matching_aliases(data, clean, remove=True)
+
+        name_by_key: Dict[str, List[Tuple[str, str]]] = {}
+        alias_by_key: Dict[str, Tuple[str, str, str]] = {}
+        for entry in data["styles"]:
+            entry_name = str(entry.get("name") or "").strip()
+            if not entry_name:
+                continue
+            entry_family = str(entry.get("family") or "").strip()
+            for key in self._alias_keys(entry_name):
+                name_by_key.setdefault(key, []).append((entry_name, entry_family))
+            for alias in entry.get("aliases") or []:
+                for key in self._alias_keys(alias):
+                    alias_by_key.setdefault(key, (entry_name, entry_family, str(alias)))
 
         name_keys = self._alias_keys(clean)
         alias_list: List[str] = []
         seen_aliases = set()
         for alias in aliases or []:
             text = str(alias).strip()
+            if S.STYLE_REF_SEPARATOR in text:
+                raise ValueError(
+                    f"Aliases cannot contain {S.STYLE_REF_SEPARATOR!r}.")
             keys = self._alias_keys(text)
             if not keys or any(key in name_keys for key in keys):
                 continue
             if any(key in seen_aliases for key in keys):
                 continue
+            for key in keys:
+                if key in name_by_key:
+                    raise ValueError(
+                        f"{text!r} is already a style name "
+                        f"({name_by_key[key][0][0]!r}).")
+                if key in alias_by_key:
+                    raise ValueError(
+                        f"{text!r} is already an alias of "
+                        f"{alias_by_key[key][0]!r}.")
             seen_aliases.update(keys)
             alias_list.append(text)
 
-        # Names and aliases already owned by the vocabulary.
-        owned: Dict[str, str] = {}
-        for entry in data["styles"]:
-            entry_name = str(entry.get("name") or "").strip()
-            if not entry_name:
-                continue
-            for key in self._keys(entry):
-                owned.setdefault(key, entry_name)
-        slug = S.style_slug(clean)
-        for entry in data["styles"]:
-            if S.style_slug(entry.get("name")) == slug:
-                raise ValueError(
-                    f"A style named {entry.get('name')!r} already exists "
-                    f"({entry.get('family') or 'no family'}).")
-        for key in name_keys:
-            owner = owned.get(key)
-            if owner:
-                raise ValueError(f"{clean!r} is already used by the style {owner!r}.")
-        for alias in alias_list:
-            for key in self._alias_keys(alias):
-                owner = owned.get(key)
-                if owner:
-                    raise ValueError(
-                        f"{alias!r} is already used by the style {owner!r}.")
-
         # Names that only the catalog knows (placeholders created by step 4).
-        reserved = reserved or {}
-        for key in name_keys:
-            if key in reserved:
-                raise ValueError(
-                    f"The catalog already contains {reserved[key]}.")
+        reserved_names = reserved_names or {}
+        if pair in reserved_names:
+            raise ValueError(f"The catalog already contains {reserved_names[pair]}.")
+        reserved_name_keys = {name_key for name_key, _family_key in reserved_names}
         for alias in alias_list:
             for key in self._alias_keys(alias):
-                if key in reserved:
-                    raise ValueError(
-                        f"{alias!r} is already used by {reserved[key]}")
+                if key in reserved_name_keys:
+                    raise ValueError(f"{alias!r} is already a catalog style name.")
 
         entry: Dict[str, Any] = {"name": clean, "family": family_name}
         if parent_name:
@@ -431,46 +470,189 @@ class VocabularyStore:
             data["families"].append(family_name)
         self._backup()
         self._write(data)
-        return entry
+        return entry, moved
 
 
 class PreviewPlayer:
-    """A tiny mpv preview process; no IPC and no state to break."""
+    """Full-track audio playback for the review tool.
 
-    def __init__(self, seconds: int = 60) -> None:
-        self.seconds = max(10, int(seconds))
-        self._process: Optional[subprocess.Popen] = None
+    Reuses the player's :class:`player.MpvPlayer` JSON-IPC client, so the review
+    window gets real pause/resume, a playback position and the track duration.
+    One idle mpv process is kept for the session and shut down with the window.
+    """
+
+    def __init__(self, volume: int = 80) -> None:
+        self.volume = max(0, min(100, int(volume)))
+        self._player: Optional[MpvPlayer] = None
+        self._lock = threading.Lock()
+        self._source = ""
+        self._position = 0.0
+        self._duration = 0.0
+        self._paused = True
+        self._ended = False
+        self._entry_id: Optional[int] = None
 
     @staticmethod
     def available() -> bool:
         return shutil.which("mpv") is not None
 
-    def play(self, source: str, seconds: Optional[int] = None) -> None:
-        self.stop()
+    def _ensure_started(self) -> MpvPlayer:
+        if self._player is not None:
+            return self._player
         if not self.available():
             raise RuntimeError("mpv was not found in PATH")
-        length = max(0, int(seconds if seconds is not None else self.seconds))
-        command = [
-            "mpv", "--no-video", "--force-window=no", "--no-terminal",
-            "--really-quiet", "--no-config", "--audio-client-name=SimpleJellyMus-review",
-        ]
-        if length > 0:
-            command.append(f"--length={length}")
-        command.append(str(source))
-        self._process = subprocess.Popen(command, stdout=subprocess.DEVNULL,
-                                         stderr=subprocess.DEVNULL,
-                                         stdin=subprocess.DEVNULL)
+        player = MpvPlayer(volume=self.volume)
+        try:
+            player.start()
+        except Exception:
+            try:
+                player.shutdown()
+            except Exception:
+                pass
+            raise
+        player.observe("time-pos", self._on_position)
+        player.observe("duration", self._on_duration)
+        player.observe("pause", self._on_pause)
+        player.on_event(self._on_event)
+        self._player = player
+        return player
+
+    # ------------------------------------------------ callbacks (mpv thread)
+    def _on_position(self, value: Any) -> None:
+        try:
+            position = max(0.0, float(value))
+        except (TypeError, ValueError):
+            return
+        with self._lock:
+            self._position = position
+
+    def _on_duration(self, value: Any) -> None:
+        # mpv reports None when the property is unavailable (for example after
+        # end-file); keep the last known duration so the finished bar stays full.
+        if value is None:
+            return
+        try:
+            duration = max(0.0, float(value))
+        except (TypeError, ValueError):
+            return
+        with self._lock:
+            self._duration = duration
+
+    def _on_pause(self, value: Any) -> None:
+        with self._lock:
+            self._paused = bool(value)
+
+    def _on_event(self, event: str, message: Dict[str, Any]) -> None:
+        with self._lock:
+            if not self._source:
+                return
+            if event == "end-file":
+                entry = message.get("playlist_entry_id")
+                current = self._entry_id
+                if entry is not None and current is not None and entry != current:
+                    return          # the previous file was replaced
+                self._ended = True
+                self._paused = False
+                if self._duration:
+                    self._position = self._duration
+            elif event in ("file-loaded", "playback-restart"):
+                self._ended = False
+
+    # ---------------------------------------------------------------- controls
+    def play(self, source: str) -> None:
+        """Load *source* and start playing it from the beginning."""
+        player = self._ensure_started()
+        text = str(source)
+        with self._lock:
+            self._source = text
+            self._position = 0.0
+            self._duration = 0.0
+            self._paused = False
+            self._ended = False
+            self._entry_id = None
+        try:
+            player.set_pause(False)
+            entry = player.load(text)
+        except Exception:
+            with self._lock:
+                self._source = ""
+                self._position = 0.0
+                self._duration = 0.0
+                self._paused = True
+                self._ended = False
+                self._entry_id = None
+            raise
+        with self._lock:
+            self._entry_id = entry
+
+    def toggle_pause(self) -> bool:
+        """Flip the pause state and return the new value."""
+        player = self._player
+        with self._lock:
+            if player is None or not self._source or self._ended:
+                return False
+            paused = not self._paused
+            self._paused = paused
+        try:
+            player.set_pause(paused)
+        except Exception:
+            with self._lock:
+                self._paused = not paused
+            raise
+        return paused
+
+    def set_volume(self, value: float) -> None:
+        """Change the volume (0-100) and remember it for the next mpv start."""
+        try:
+            volume = max(0, min(100, int(round(float(value)))))
+        except (TypeError, ValueError):
+            return
+        self.volume = volume
+        player = self._player
+        if player is not None:
+            try:
+                player.set_volume(volume)
+            except Exception:
+                pass
+
+    def seek(self, seconds: float) -> None:
+        player = self._player
+        if player is None:
+            return
+        with self._lock:
+            target = max(0.0, float(seconds))
+            if self._duration > 0:
+                target = min(target, self._duration)
+            self._position = target
+        player.seek(target, absolute=True)
 
     def stop(self) -> None:
-        process = self._process
-        self._process = None
-        if process is None or process.poll() is not None:
-            return
-        process.terminate()
-        try:
-            process.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            process.kill()
+        """Stop the sound, keep mpv alive and reset the position."""
+        player = self._player
+        with self._lock:
+            had_source = bool(self._source)
+            self._source = ""
+            self._position = 0.0
+            self._duration = 0.0
+            self._paused = True
+            self._ended = False
+            self._entry_id = None
+        if player is not None and had_source:
+            player.stop()
+
+    def close(self) -> None:
+        player = self._player
+        self._player = None
+        self.stop()
+        if player is not None:
+            player.shutdown()
+
+    def snapshot(self) -> Dict[str, Any]:
+        """A thread-safe copy of the state the UI needs on every tick."""
+        with self._lock:
+            return {"source": self._source, "position": self._position,
+                    "duration": self._duration, "paused": self._paused,
+                    "ended": self._ended}
 
 
 class ReviewCatalog:
@@ -581,6 +763,7 @@ class ReviewCatalog:
             (rel_path,))]
 
     def suggestion(self, row: Dict[str, Any]) -> Optional[str]:
+        """The best known style id for this album/artist, if any."""
         names = self.style_names()
         for column in ("album_key", "artist_key"):
             key = str(row.get(column) or "")
@@ -594,8 +777,17 @@ class ReviewCatalog:
                 " GROUP BY primary_style ORDER BY n DESC LIMIT 1",
                 (key, row.get("rel_path"))).fetchone()
             if found and found["primary_style"] in names:
-                return names[found["primary_style"]]
+                return str(found["primary_style"])
         return None
+
+    def style_reference(self, style: Dict[str, Any]) -> str:
+        """Short name, or ``Family::Name`` when the name is duplicated."""
+        name = str(style.get("name") or "")
+        family = str(style.get("family") or "")
+        if family and sum(1 for other in self.styles()
+                          if S.norm_key(other.get("name")) == S.norm_key(name)) > 1:
+            return S.style_ref(family, name)
+        return name
 
     def scope_count(self, kind: str, row: Dict[str, Any]) -> int:
         if kind == "tracks":
@@ -617,6 +809,9 @@ class ReviewCatalog:
             S.refresh_track_primary(self.connection)
             S.rebuild_artist_rollup(self.connection)
             self.connection.commit()
+        except SystemExit as exc:
+            self.connection.rollback()
+            raise RuntimeError(str(exc)) from exc
         except Exception:
             self.connection.rollback()
             raise
@@ -649,7 +844,8 @@ class ReviewApp:
 
     def __init__(self, root: tk.Tk, *, config: Dict[str, Any],
                  db_path: Optional[Any] = None,
-                 overrides_path: Optional[Any] = None) -> None:
+                 overrides_path: Optional[Any] = None,
+                 preview: Optional[PreviewPlayer] = None) -> None:
         self.root = root
         self.root.title("SimpleJellyMus · Style review")
         self.root.geometry("1180x760")
@@ -671,7 +867,8 @@ class ReviewApp:
         normalize = dict(config.get("normalize") or {})
         normalize["overrides_file"] = str(override_file)
         config["normalize"] = normalize
-        self.preview = PreviewPlayer()
+        self.preview = preview if preview is not None else PreviewPlayer()
+        self._playback_job: Optional[str] = None
         self.rows: List[Dict[str, Any]] = []
         self._hidden: set = set()
         self.styles: List[Dict[str, Any]] = []
@@ -689,8 +886,9 @@ class ReviewApp:
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.root.bind("<Control-s>", lambda _event: self.save("tracks"))
         self.root.bind("<Control-n>", lambda _event: self.open_new_style_dialog())
-        self.root.bind("<F5>", lambda _event: self.preview_current())
-        self.root.bind("<Escape>", lambda _event: self.preview.stop())
+        self.root.bind("<F5>", lambda _event: self.toggle_playback())
+        self.root.bind("<Escape>", lambda _event: self.stop_playback())
+        self._playback_job = self.root.after(250, self._tick_playback)
 
     # ------------------------------------------------------------- widgets
     def _label(self, parent: tk.Misc, text: str = "", *, size: int = 10,
@@ -747,8 +945,11 @@ class ReviewApp:
         left = tk.Frame(body, bg=CARD, width=440)
         left.pack(side="left", fill="y", padx=(0, 12))
         left.pack_propagate(False)
-        self._label(left, "Tracks to review", size=11, bold=True).pack(
-            anchor="w", padx=12, pady=(10, 6))
+        left_header = tk.Frame(left, bg=CARD)
+        left_header.pack(fill="x", padx=12, pady=(10, 6))
+        self._label(left_header, "Tracks to review", size=11, bold=True).pack(side="left")
+        self._button(left_header, "Remove missing…",
+                     self.prune_missing_tracks).pack(side="right")
         queue_frame = tk.Frame(left, bg=CARD)
         queue_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
         scroll = tk.Scrollbar(queue_frame)
@@ -788,13 +989,53 @@ class ReviewApp:
 
         playback = tk.Frame(pad, bg=CARD)
         playback.pack(fill="x", pady=(12, 0))
-        self._button(playback, "▶ Preview 60 s", self.preview_current,
-                     accent=True).pack(side="left")
-        self._button(playback, "Full track", lambda: self.preview_current(full=True)).pack(
-            side="left", padx=(8, 0))
-        self._button(playback, "■ Stop", self.preview.stop).pack(side="left", padx=(8, 0))
-        self.preview_status = self._label(playback, "", size=9, color=MUTED)
+        self.play_button = self._button(playback, "▶ Play", self.toggle_playback,
+                                        accent=True, width=10)
+        self.play_button.pack(side="left")
+        self.preview_status = self._label(playback, "No track playing", size=9,
+                                          color=MUTED)
         self.preview_status.pack(side="left", padx=(12, 0))
+
+        volume_box = tk.Frame(playback, bg=CARD)
+        volume_box.pack(side="right")
+        self._label(volume_box, "Volume", size=9, color=MUTED).pack(side="left")
+        self._volume = tk.DoubleVar(value=float(self.preview.volume))
+        try:
+            ttk.Style().configure("Review.Horizontal.TScale",
+                                  troughcolor=CARD_LIGHT, background=CARD,
+                                  darkcolor=ACCENT, lightcolor=ACCENT)
+        except tk.TclError:
+            pass
+        self.volume_scale = ttk.Scale(
+            volume_box, from_=0, to=100, orient="horizontal", length=110,
+            variable=self._volume, command=self._volume_changed,
+            style="Review.Horizontal.TScale", cursor="hand2")
+        self.volume_scale.pack(side="left", padx=(6, 6))
+        self.volume_label = self._label(volume_box, f"{int(self.preview.volume)}%",
+                                        size=9, color=MUTED, width=4)
+        self.volume_label.pack(side="left")
+
+        progress_row = tk.Frame(pad, bg=CARD)
+        progress_row.pack(fill="x", pady=(6, 0))
+        self.position_label = self._label(progress_row, "0:00", size=8, color=MUTED)
+        self.position_label.pack(side="left")
+        self.progress_var = tk.DoubleVar(value=0.0)
+        try:
+            ttk.Style().configure("Review.Horizontal.TProgressbar",
+                                  troughcolor=CARD_LIGHT, background=ACCENT,
+                                  bordercolor=CARD, lightcolor=ACCENT,
+                                  darkcolor=ACCENT)
+        except tk.TclError:
+            pass
+        self.progress = ttk.Progressbar(progress_row, variable=self.progress_var,
+                                        maximum=1.0, mode="determinate",
+                                        style="Review.Horizontal.TProgressbar",
+                                        cursor="hand2")
+        self.progress.pack(side="left", fill="x", expand=True, padx=(8, 8))
+        self.progress.bind("<Button-1>", self._seek_progress)
+        self.progress.bind("<B1-Motion>", self._seek_progress)
+        self.duration_label = self._label(progress_row, "0:00", size=8, color=MUTED)
+        self.duration_label.pack(side="right")
 
         style_box = tk.Frame(pad, bg=CARD)
         style_box.pack(fill="both", expand=True, pady=(16, 0))
@@ -914,12 +1155,22 @@ class ReviewApp:
         index = int(selection[0])
         if index >= len(self.rows):
             return
-        self.current = self.rows[index]
-        self.preview.stop()
-        self.preview_status.configure(text="")
+        row = self.rows[index]
+        changed = (self.current is None
+                   or str(row.get("rel_path")) != str(self.current.get("rel_path")))
+        self.current = row
+        if changed:
+            self.preview.stop()
+            self._reset_progress()
+            self._set_play_button(True)
+            self.preview_status.configure(text="No track playing")
         self._update_details()
 
     def _show_empty(self) -> None:
+        self.preview.stop()
+        self._reset_progress()
+        self._set_play_button(True)
+        self.preview_status.configure(text="No track playing")
         self.track_title.configure(text="Nothing to review")
         self.track_meta.configure(text=f"Queue: {self._mode.get()}")
         self.track_path.configure(text="")
@@ -929,7 +1180,7 @@ class ReviewApp:
         self.selected_style = None
         self._clear_style_selection()
         for button in (self.track_button, self.album_button, self.artist_button,
-                       self.unknown_button, self.clear_button):
+                       self.unknown_button, self.clear_button, self.play_button):
             button.configure(state="disabled")
         self.status.configure(text="Nothing in this queue.")
 
@@ -980,6 +1231,7 @@ class ReviewApp:
                                      state="normal" if artist_count else "disabled")
         for button in (self.track_button, self.unknown_button):
             button.configure(state="normal")
+        self.play_button.configure(state="normal")
         self.clear_button.configure(state="normal" if existing else "disabled")
         artist = str(row.get("album_artist") or row.get("artists") or "")
         if LABELISH.search(artist):
@@ -991,15 +1243,17 @@ class ReviewApp:
             self._clear_style_selection()
             self.style_info.configure(text="Marked unknown (empty override).")
         elif existing and existing[2].get("styles"):
-            self._select_style_by_name(str(existing[2]["styles"][0]))
+            self._select_style_ref(str(existing[2]["styles"][0]))
         elif row.get("primary_style"):
-            self._select_style_by_name(self.catalog.style_names().get(
-                str(row["primary_style"]), ""))
+            self._select_style_by_id(str(row["primary_style"]))
         else:
             suggestion = self.catalog.suggestion(row)
             if suggestion:
-                self._select_style_by_name(suggestion)
-                self.style_info.configure(text=f"Suggested from this album/artist: {suggestion}")
+                self._select_style_by_id(suggestion)
+                suggested_name = self.catalog.style_names().get(
+                    suggestion, suggestion)
+                self.style_info.configure(
+                    text=f"Suggested from this album/artist: {suggested_name}")
             else:
                 self._clear_style_selection()
                 self.style_info.configure(text="No style selected — type to find one.")
@@ -1021,41 +1275,50 @@ class ReviewApp:
                 families.add(family)
         return sorted(families, key=str.casefold)
 
-    def _catalog_reserved(self) -> Dict[str, str]:
-        """Names/aliases the catalog already knows but the vocabulary may not."""
-        reserved: Dict[str, str] = {}
+    def _catalog_reserved(self) -> Dict[Tuple[str, str], str]:
+        """Styles the catalog knows only by ``(family, name)``, e.g. placeholders."""
+        reserved: Dict[Tuple[str, str], str] = {}
         for style in self.catalog.styles():
             name = str(style.get("name") or "").strip()
             if not name:
                 continue
-            description = f"{name!r}"
-            for key in VocabularyStore._alias_keys(name):
-                reserved.setdefault(key, description)
-            try:
-                aliases = json.loads(style.get("aliases") or "[]")
-            except ValueError:
-                aliases = []
-            for alias in aliases:
-                for key in VocabularyStore._alias_keys(alias):
-                    reserved.setdefault(key, description)
+            family = str(style.get("family") or "").strip()
+            reserved.setdefault(
+                S.style_pair_key(name, family),
+                f"{name!r} ({family or 'no family'})")
         return reserved
 
     def add_style(self, name: str, family: str, *, parent: str = "",
-                  aliases: Sequence[str] = ()) -> Dict[str, Any]:
+                  aliases: Sequence[str] = ()):
         """Add a canonical style to styles.json and the catalog.
 
-        Raises ``ValueError`` for invalid input and ``RuntimeError`` when the
-        vocabulary was written but the catalog could not be updated.
+        Returns ``(entry, style_id, moved_aliases)``. Raises ``ValueError`` for
+        invalid input and ``RuntimeError`` when the vocabulary was written but
+        the catalog could not be updated.
         """
-        entry = self.vocabulary.add(name, family, parent=parent, aliases=aliases,
-                                    reserved=self._catalog_reserved())
+        entry, moved = self.vocabulary.add(
+            name, family, parent=parent, aliases=aliases,
+            reserved_names=self._catalog_reserved())
         try:
-            S.upsert_style(
+            parent_id = None
+            if entry.get("parent"):
+                parent_row = S.find_style(
+                    self.catalog.connection, entry["parent"], entry.get("family"))
+                if parent_row is None:
+                    raise ValueError(
+                        f"parent {entry['parent']!r} is not in the catalog; "
+                        "run step3_vocabulary.py --build")
+                parent_id = parent_row["id"]
+            style_id = S.upsert_style(
                 self.catalog.connection, entry["name"],
-                family=entry.get("family"),
-                parent=S.style_slug(entry["parent"]) if entry.get("parent") else None,
-                aliases=entry.get("aliases") or [],
-                source="human")
+                family=entry.get("family"), parent=parent_id,
+                aliases=entry.get("aliases") or [], source="human")
+            for owner_name, owner_family, alias in moved:
+                owner = S.find_style(self.catalog.connection,
+                                     owner_name, owner_family)
+                if owner is not None:
+                    S.remove_style_aliases(self.catalog.connection,
+                                           owner["id"], [alias])
             self.catalog.connection.commit()
         except Exception as exc:
             self.catalog.connection.rollback()
@@ -1065,13 +1328,17 @@ class ReviewApp:
                 "Run: python3 styles/step3_vocabulary.py --build") from exc
         self.catalog.reload_styles()
         self._load_styles()
-        self._select_style_by_name(entry["name"])
+        self._select_style_by_id(style_id)
         details = entry.get("family") or "no family"
         if entry.get("parent"):
             details += f" · sub-style of {entry['parent']}"
+        if moved:
+            moved_text = ", ".join(
+                f"{alias!r} from {owner}" for owner, _family, alias in moved)
+            details += f" · moved {moved_text}"
         self._status(f"Added {entry['name']!r} ({details}) to "
                      f"{self.vocabulary.path.name} and the catalog · source human")
-        return entry
+        return entry, style_id, moved
 
     def open_new_style_dialog(self) -> None:
         NewStyleDialog(self)
@@ -1160,6 +1427,37 @@ class ReviewApp:
                 return
         self._clear_style_selection()
 
+    def _select_style_by_id(self, style_id: Any) -> bool:
+        """Select one exact style row (safe when the name is duplicated)."""
+        wanted = str(style_id or "")
+        if not wanted:
+            return False
+        self._style_query.set("")
+        self._filter_styles()
+        for index, style in enumerate(self.filtered_styles):
+            if str(style.get("id") or "") == wanted:
+                self.style_list.selection_clear(0, "end")
+                self.style_list.selection_set(index)
+                self.style_list.activate(index)
+                self.style_list.see(index)
+                self._on_style_select()
+                return True
+        self._clear_style_selection()
+        return False
+
+    def _select_style_ref(self, reference: str) -> bool:
+        """Select a stored override entry: a name or ``Family::Name``."""
+        parsed = S.parse_style_ref(reference)
+        if parsed is not None:
+            family, name = parsed
+            for style in self.styles:
+                if (S.norm_key(style.get("family")) == S.norm_key(family)
+                        and S.norm_key(style.get("name")) == S.norm_key(name)):
+                    return self._select_style_by_id(style.get("id"))
+            self._clear_style_selection()
+            return False
+        return self._select_style_by_name(reference)
+
     def _clear_style_selection(self) -> None:
         self.selected_style = None
         if hasattr(self, "style_list"):
@@ -1180,6 +1478,92 @@ class ReviewApp:
             return "", 0
         return scope_key(row, kind), self.catalog.scope_count(kind, row)
 
+    def prune_missing_tracks(self) -> None:
+        """Delete catalog rows whose files are no longer under ``music_root``."""
+        root = self.catalog.music_root
+        if root is None or not root.is_dir() or not os.access(root, os.R_OK):
+            self._status("Music root is not available; set music_root in "
+                         "styles/config.json.", error=True)
+            return
+        connection = self.catalog.connection
+        paths = [str(row["rel_path"]) for row in connection.execute(
+            "SELECT rel_path FROM tracks ORDER BY rel_path")]
+        total = len(paths)
+        if not total:
+            self._status("The catalog has no tracks.")
+            return
+        self._status(f"Checking {total:,} tracks for missing files…")
+        self.root.update_idletasks()
+        missing = [rel for rel in paths if not (root / rel).is_file()]
+        if not missing:
+            self._status("No missing files: every catalog track still exists.")
+            return
+        if len(missing) == total:
+            messagebox.showerror(
+                "Nothing deleted",
+                f"All {total:,} catalog tracks are missing under\n{root}\n\n"
+                "This looks like an unmounted or moved music folder, so nothing "
+                "was deleted. Check music_root in styles/config.json.",
+                parent=self.root)
+            self._status("Prune refused: no files are visible under the music root.",
+                         error=True)
+            return
+        sample = "\n".join(missing[:8])
+        more = f"\n… and {len(missing) - 8:,} more" if len(missing) > 8 else ""
+        warning = ""
+        if len(missing) > max(50, int(total * 0.25)):
+            warning = ("\n\n⚠ This is a large part of the catalog. Check that "
+                       "the music folder is mounted before deleting.\n")
+        if not messagebox.askyesno(
+                "Remove missing tracks",
+                f"{len(missing):,} of {total:,} catalog track(s) have no file under:\n"
+                f"{root}\n\n{sample}{more}{warning}\n"
+                "Delete their catalog rows and labels?\n"
+                "(No music file is ever changed.)",
+                parent=self.root):
+            return
+        self._status(f"Removing {len(missing):,} missing track(s)…")
+        self.root.update_idletasks()
+        missing_set = set(missing)
+        try:
+            for start in range(0, len(missing), 900):
+                chunk = missing[start:start + 900]
+                marks = ",".join("?" * len(chunk))
+                connection.execute(
+                    f"DELETE FROM track_styles WHERE rel_path IN ({marks})", chunk)
+                connection.execute(
+                    f"DELETE FROM tracks WHERE rel_path IN ({marks})", chunk)
+            # Also clean any orphan labels left by an older direct delete.
+            connection.execute(
+                "DELETE FROM track_styles WHERE rel_path NOT IN"
+                " (SELECT rel_path FROM tracks)")
+            # Keep the audit/count tables in step with the remaining library.
+            connection.execute(
+                "DELETE FROM raw_genres WHERE raw NOT IN ("
+                " SELECT DISTINCT raw_genre FROM tracks"
+                " WHERE TRIM(COALESCE(raw_genre, '')) <> '')")
+            connection.execute(
+                "UPDATE raw_genres SET tracks=(SELECT COUNT(*) FROM tracks t"
+                " WHERE t.raw_genre=raw_genres.raw), updated_at=?",
+                (S.now(),))
+            S.refresh_style_counts(connection)
+            S.rebuild_artist_rollup(connection)      # also drops empty artists
+            connection.commit()
+        except Exception as exc:
+            connection.rollback()
+            self._status(f"Could not prune tracks: {exc}", error=True)
+            return
+        if str((self.current or {}).get("rel_path") or "") in missing_set:
+            self.preview.stop()
+            self._reset_progress()
+            self._set_play_button(True)
+            self.preview_status.configure(text="No track playing")
+        self._hidden.difference_update(missing_set)
+        self.catalog.reload_styles()
+        self._load_styles()
+        self.reload_queue()
+        self._status(f"Removed {len(missing):,} missing track(s) from the catalog.")
+
     def save(self, kind: str) -> None:
         if self.current is None:
             self._status("Select a track first.", error=True)
@@ -1192,6 +1576,7 @@ class ReviewApp:
         if not key or count <= 0:
             self._status(f"This track has no {scope_label(kind)} scope.", error=True)
             return
+        reference = self.catalog.style_reference(self.selected_style)
         artist = str(self.current.get("album_artist") or self.current.get("artists") or "")
         if kind == "artists" and LABELISH.search(artist):
             if not messagebox.askyesno(
@@ -1204,16 +1589,16 @@ class ReviewApp:
         if count > 1:
             if not messagebox.askyesno(
                     "Save to multiple tracks?",
-                    f"Apply {self.selected_style['name']!r} to {count} "
+                    f"Apply {reference!r} to {count} "
                     f"track(s) of this {scope_label(kind)}?"):
                 return
         try:
-            self.overrides.set(kind, key, [self.selected_style["name"]],
+            self.overrides.set(kind, key, [reference],
                                exclusive=bool(self._exclusive.get()), note="review GUI")
         except Exception as exc:
             self._status(f"Could not write overrides.json: {exc}", error=True)
             return
-        self._status(f"Applying {self.selected_style['name']!r} to {count} track(s)…")
+        self._status(f"Applying {reference!r} to {count} track(s)…")
         self.root.update_idletasks()
         try:
             _overridden, errors = self.catalog.apply_overrides()
@@ -1222,7 +1607,7 @@ class ReviewApp:
             return
         if errors:
             messagebox.showwarning("Some overrides failed", "\n".join(errors))
-        self._status(f"Saved {self.selected_style['name']!r} to {count} track(s) "
+        self._status(f"Saved {reference!r} to {count} track(s) "
                      f"· source human · catalog updated")
         self.reload_queue(select_index=self._selected_index())
 
@@ -1295,26 +1680,147 @@ class ReviewApp:
         self.queue_list.see(index)
         self._on_queue_select()
 
-    def preview_current(self, full: bool = False) -> None:
+    # ------------------------------------------------------------- playback
+    def _current_source(self) -> Optional[str]:
         row = self.current
         if row is None:
+            return None
+        path = self.catalog.local_path(row)
+        if path is not None:
+            return str(path)
+        return self.catalog.stream_url(row)
+
+    def toggle_playback(self) -> None:
+        if self.current is None:
             self._status("Select a track first.", error=True)
             return
-        path = self.catalog.local_path(row)
-        source = str(path) if path else self.catalog.stream_url(row)
+        source = self._current_source()
         if not source:
-            self._status("File not found locally and Jellyfin has no stream URL.", error=True)
+            self._status("File not found locally and Jellyfin has no stream URL.",
+                         error=True)
             return
+        state = self.preview.snapshot()
+        same = str(state.get("source") or "") == source
+        ended = bool(state.get("ended"))
         try:
-            self.preview.play(source, 0 if full else 60)
+            if same and not ended:
+                paused = self.preview.toggle_pause()
+                self._set_play_button(paused)
+                self.preview_status.configure(
+                    text="paused" if paused else "playing full track")
+            else:
+                self.preview.play(source)
+                self._reset_progress()
+                self._set_play_button(False)
+                self.preview_status.configure(text="playing full track")
         except Exception as exc:
             self._status(f"Could not start mpv: {exc}", error=True)
+            self._set_play_button(True)
+            self.preview_status.configure(text="mpv error")
+
+    def stop_playback(self) -> None:
+        self.preview.stop()
+        self._reset_progress()
+        self._set_play_button(True)
+        self.preview_status.configure(text="No track playing")
+
+    def _volume_changed(self, value: Any = None) -> None:
+        try:
+            volume = max(0, min(100, int(round(float(value)))))
+        except (TypeError, ValueError):
+            volume = int(round(self._volume.get()))
+        if hasattr(self, "volume_label"):
+            self.volume_label.configure(text=f"{volume}%")
+        self.preview.set_volume(volume)
+
+    def _tick_playback(self) -> None:
+        self._update_playback()
+        self._playback_job = self.root.after(250, self._tick_playback)
+
+    def _update_playback(self) -> None:
+        try:
+            state = self.preview.snapshot()
+        except Exception:
             return
-        self.preview_status.configure(text="playing full track" if full else "preview 60 s")
+        source = str(state.get("source") or "")
+        if not source:
+            return
+        duration = self._known_duration(float(state.get("duration") or 0.0))
+        position = float(state.get("position") or 0.0)
+        paused = bool(state.get("paused"))
+        ended = bool(state.get("ended"))
+        self._set_progress(position, duration)
+        self._set_play_button(paused or ended)
+        if ended:
+            self.preview_status.configure(text="finished")
+        elif paused:
+            self.preview_status.configure(text="paused")
+        elif duration > 0 or position > 0:
+            self.preview_status.configure(text="playing full track")
+        else:
+            self.preview_status.configure(text="loading…")
+
+    def _known_duration(self, duration: float) -> float:
+        """mpv's duration, or the catalog's for a stream that has not reported one."""
+        if duration > 0:
+            return duration
+        row = self.current or {}
+        try:
+            return max(0.0, float(row.get("duration_ms") or 0) / 1000.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _format_time(seconds: float) -> str:
+        total = int(max(0.0, seconds))
+        if total >= 3600:
+            return (f"{total // 3600}:{(total % 3600) // 60:02d}:"
+                    f"{total % 60:02d}")
+        return f"{total // 60}:{total % 60:02d}"
+
+    def _set_progress(self, position: float, duration: float) -> None:
+        fraction = position / duration if duration > 0 else 0.0
+        self.progress_var.set(max(0.0, min(1.0, fraction)))
+        self.position_label.configure(text=self._format_time(position))
+        self.duration_label.configure(
+            text=self._format_time(duration) if duration > 0 else "--:--")
+
+    def _reset_progress(self) -> None:
+        self.progress_var.set(0.0)
+        self.position_label.configure(text="0:00")
+        self.duration_label.configure(text="0:00")
+
+    def _set_play_button(self, paused: bool) -> None:
+        self.play_button.configure(text="▶ Play" if paused else "Pause")
+
+    def _seek_progress(self, event: Any) -> None:
+        width = max(1, self.progress.winfo_width())
+        fraction = max(0.0, min(1.0, float(getattr(event, "x", 0)) / width))
+        self._seek_fraction(fraction)
+
+    def _seek_fraction(self, fraction: float) -> None:
+        state = self.preview.snapshot()
+        duration = self._known_duration(float(state.get("duration") or 0.0))
+        if duration <= 0:
+            return
+        target = duration * max(0.0, min(1.0, float(fraction)))
+        try:
+            self.preview.seek(target)
+        except Exception as exc:
+            self._status(f"Could not seek: {exc}", error=True)
+            return
+        self._set_progress(target, duration)
 
     def close(self) -> None:
+        job = self._playback_job
+        self._playback_job = None
+        if job:
+            try:
+                self.root.after_cancel(job)
+            except tk.TclError:
+                pass
         try:
-            self.preview.stop()
+            self.preview.close()
         finally:
             try:
                 self.catalog.close()
@@ -1438,10 +1944,22 @@ class NewStyleDialog(tk.Toplevel):
             parent = ""
         aliases = [part.strip() for part in re.split(r"[,;]", self._aliases_var.get())
                    if part.strip()]
+        name = self._name_var.get().strip()
+        family = self._family_var.get().strip()
+        moves = self.app.vocabulary.alias_moves(name)
+        if moves:
+            owners = ", ".join(sorted({
+                f"{owner} ({owner_family or 'no family'})"
+                for owner, owner_family, _alias in moves}))
+            spellings = ", ".join(sorted({alias for _owner, _family, alias in moves}))
+            if not messagebox.askyesno(
+                    "Move an alias",
+                    f"{spellings} is currently an alias of {owners}.\n\n"
+                    "Add the new style and move the alias to it?",
+                    parent=self):
+                return
         try:
-            self.app.add_style(self._name_var.get().strip(),
-                               self._family_var.get().strip(),
-                               parent=parent, aliases=aliases)
+            self.app.add_style(name, family, parent=parent, aliases=aliases)
         except ValueError as exc:
             messagebox.showerror("Cannot add the style", str(exc), parent=self)
             return

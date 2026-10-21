@@ -7,10 +7,14 @@
     "that appear in file tags. Nothing here changes your music files - the mapping",
     "lives in the dataset (catalog.sqlite) and can always be recomputed.",
     "",
-    "  name    - the label the player will show and filter by",
-    "  family  - the coarse bucket (also selectable in the player)",
-    "  parent  - optional finer hierarchy (used to group the picker)",
+    "  name    - the label the player will show; unique inside its family",
+    "  family  - the coarse bucket (the same name may exist in several families)",
+    "  parent  - optional finer hierarchy, a style name in the same family",
     "  aliases - other spellings, misspellings and abbreviations seen in the wild",
+    "",
+    "A style is identified by (name, family). To select one of several same-named",
+    "styles use Family::Name in overrides or --style (for example Punk::Hardcore).",
+    "Aliases are globally unique and an exact style name always wins over an alias.",
     "",
     "After editing run:  python3 step3_vocabulary.py --all   (check + load + coverage)"
   ],
@@ -160,6 +164,7 @@
     {"name": "World", "family": "Other", "aliases": ["world", "world music", "ethnic", "tribal", "afrobeat", "reggae world", "klezmer", "balkan", "gypsy"]},
     {"name": "Epic Metal", "family": "Metal", "parent": "Power Metal", "aliases": ["epic metal", "epic"]},
     {"name": "Industrial Rock", "family": "Rock", "aliases": ["industrial rock"]},
-    {"name": "Christian Rock", "family": "Rock", "aliases": []}
+    {"name": "Christian Rock", "family": "Rock", "aliases": []},
+    {"name": "Various", "family": "Metal", "aliases": []}
   ]
 }

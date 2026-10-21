@@ -289,6 +289,13 @@ class MpvPlayer:
         """Play *source* (local path or URL) now; returns the new mpv entry id."""
         return self._entry_id(self._send(["loadfile", str(source), "replace"]))
 
+    def stop(self) -> None:
+        """Unload the current file but keep the process alive (idle)."""
+        try:
+            self._send(["stop"], timeout=2.0)
+        except PlayerError:
+            pass
+
     def append(self, source: Any) -> Optional[int]:
         """Queue *source* right after the current entry (preload hook).
 
