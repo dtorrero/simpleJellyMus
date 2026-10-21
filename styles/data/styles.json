@@ -159,6 +159,7 @@
     {"name": "Compilation", "family": "Other", "aliases": ["compilation", "various artists", "sampler", "best of", "greatest hits", "collection", "discography", "box set", "anthology", "mixtape", "dj mix", "megamix", "remix", "bootleg", "live", "concert", "unplugged"]},
     {"name": "World", "family": "Other", "aliases": ["world", "world music", "ethnic", "tribal", "afrobeat", "reggae world", "klezmer", "balkan", "gypsy"]},
     {"name": "Epic Metal", "family": "Metal", "parent": "Power Metal", "aliases": ["epic metal", "epic"]},
-    {"name": "Industrial Rock", "family": "Rock", "aliases": ["industrial rock"]}
+    {"name": "Industrial Rock", "family": "Rock", "aliases": ["industrial rock"]},
+    {"name": "Christian Rock", "family": "Rock", "aliases": []}
   ]
 }

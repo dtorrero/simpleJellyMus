@@ -151,7 +151,8 @@ When automatic detection fails — no genre tag, no style, a family-only label o
 low-confidence entry in `out/review.csv` — use the small Tkinter review tool:
 
 > **Status:** this tool is new and not fully tested against every library.
-> Start with a small queue; every save backs up `overrides.json` in `out/`.
+> Start with a small queue; every save backs up `overrides.json` in `out/`,
+> and every new style backs up `styles.json` there too.
 
 ```bash
 cd styles
@@ -163,19 +164,48 @@ only`, `Review queue (CSV)` or `All tracks`), plays a 60-second preview through
 mpv, and lets you type in the style box to find a style instantly. The first
 match is highlighted; Enter selects it.
 
-Saving writes the verdict in two places:
+### Adding a style the pipeline did not produce
+
+If the style you need does not exist at all, press **New style…** (or `Ctrl+N`)
+next to the style box. The form uses the same vocabulary format as
+`data/styles.json`:
+
+| field | meaning |
+|---|---|
+| **Family** | the coarse bucket; pick one or type a new family (it is appended to the `families` list) |
+| **Style name** | the canonical label the player shows (`name` in `styles.json`) |
+| **Sub-style of** | optional `parent`, a style of the same family (the finer hierarchy) |
+| **Aliases** | comma-separated spellings/misspellings from file tags |
+
+Adding writes the entry in two places: it appends one line to
+`data/styles.json` (with a timestamped backup in `out/`) and immediately upserts
+the same row into `catalog.sqlite` with `source='human'`. The new style is
+selected in the picker at once and can be saved to a track/album/artist without
+restarting the tool. The aliases also become part of the vocabulary, so the next
+`step3`/`step4` run maps those raw tags to it. No pipeline run is needed for the
+entry itself; the next `step3_vocabulary.py --build` simply finds it already
+there.
+
+Names and aliases already used by another style (or by an automatic
+`… (unspecified)` placeholder in the catalog) are rejected, so a new style
+cannot make tag mapping ambiguous. A style starts with zero tracks; assign it
+with the save buttons. A running player caches its style list, so restart it to
+see a brand-new style there.
+
+Saving a verdict writes it in two places:
 
 * `data/overrides.json` (the permanent manual record, with a backup in `out/`);
 * `catalog.sqlite`, immediately, through the same `apply_overrides()` used by
   `step4_normalize.py`.
 
 The database label therefore has `source='human'`, `tracks.label_source='human'`
-and `confidence=1.0`. The player sees it on the next style query — reopen the
-`G` panel to refresh its list/counts. No music file and no Jellyfin data is
-touched.
+and `confidence=1.0`. The player caches its style list and counts in memory, so
+restart it to see the new label. No music file and no Jellyfin data is touched.
 
 Useful details:
 
+* **New style…** (`Ctrl+N`) writes a missing style to `data/styles.json` **and**
+  the catalog in one go (family, optional sub-style parent and aliases).
 * **Save to track / album / artist** buttons show how many tracks they affect.
   For album names that are really labels (`UniqueLeaderRecords`, `20BuckSpin`),
   the GUI warns and recommends album/track-level saves.
@@ -351,7 +381,9 @@ step that turns an agreement among them into labels.
 
 `data/styles.json` is the vocabulary (styles, families, spelling variants) and
 `data/rules.json` is the behaviour (what to drop, what to split, typos,
-fallbacks). Both are plain text, versioned in git, and yours to edit.
+fallbacks). Both are plain text, versioned in git, and yours to edit. The review
+GUI's **New style…** button appends one entry to `data/styles.json` for you and
+loads it into the catalog, so hand-editing is only needed for bulk changes.
 
 ```bash
 python3 step3_vocabulary.py --uncovered   # what the vocabulary does not know yet

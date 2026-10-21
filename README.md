@@ -227,10 +227,11 @@ If a style is missing or wrong, the optional review tool can fix it by hand:
 python3 styles/review_gui.py
 ```
 
-It lists the unlabelled or low-confidence tracks, previews them through mpv and
-saves a `human`/manual override (see `styles/README.md`). It is a separate tool;
-the player itself still opens the catalog read-only. The review tool is new and
-not fully tested against every library — start with a small queue.
+It lists the unlabelled or low-confidence tracks, previews them through mpv,
+saves a `human`/manual override, and can add a missing style (family,
+sub-style, aliases) to the vocabulary (see `styles/README.md`). It is a separate
+tool; the player itself still opens the catalog read-only. The review tool is
+new and not fully tested against every library — start with a small queue.
 
 The app starts **windowed** (remembering the size and fullscreen/windowed mode
 you used last time) and `Esc` switches between windowed and fullscreen.

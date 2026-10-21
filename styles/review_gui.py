@@ -10,6 +10,10 @@ A saved verdict goes into ``data/overrides.json`` and is applied with the same
 ``step4_normalize.apply_overrides`` function the pipeline uses. The resulting
 ``track_styles`` row has ``source='human'`` and survives future pipeline runs.
 
+The tool can also add a **new canonical style** to ``data/styles.json`` (name,
+family, optional parent/sub-style and aliases) and load it into the catalog
+immediately, so a style the automatic pipeline never saw can be used at once.
+
     python3 styles/review_gui.py
     python3 styles/review_gui.py --list no_style --limit 20
     python3 styles/review_gui.py --db /tmp/catalog.sqlite
@@ -37,6 +41,7 @@ sys.path.insert(0, str(STYLES_DIR))
 sys.path.insert(0, str(ROOT))
 
 import styles_db as S  # noqa: E402
+from step3_vocabulary import normalize_raw  # noqa: E402
 from step4_normalize import Normalizer, apply_overrides  # noqa: E402
 
 # Same palette/font preference as the player, so the tool feels native.
@@ -188,6 +193,247 @@ class OverrideStore:
         return None
 
 
+FAMILY_LINE_WIDTH = 82
+
+
+def _quote(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _wrap_families(families: Sequence[str], width: int = FAMILY_LINE_WIDTH) -> List[str]:
+    """Wrap the family names the way the current ``styles.json`` does."""
+    lines: List[str] = []
+    current = "    "
+    for index, family in enumerate(families):
+        token = _quote(family) + ("," if index < len(families) - 1 else "")
+        if current.strip() and len(current) + 1 + len(token) > width:
+            lines.append(current)
+            current = "    "
+        current += ("" if current == "    " else " ") + token
+    if current.strip():
+        lines.append(current)
+    return lines or ["    "]
+
+
+def dump_vocabulary(data: Dict[str, Any]) -> str:
+    """Serialise ``data/styles.json`` in the format the project documents.
+
+    The vocabulary is hand-edited and versioned, so it keeps the existing
+    layout: *one style per line* and the families wrapped at roughly 82
+    columns. ``json.dump(indent=2)`` would turn every style into a multi-line
+    block and make every future diff unreadable.
+    """
+    known = {"_comment", "version", "families", "styles"}
+    if any(key not in known for key in data):
+        # Do not lose an unknown top-level key: fall back to plain JSON.
+        return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+
+    lines: List[str] = ["{"]
+    comment = data.get("_comment")
+    if isinstance(comment, list):
+        lines.append('  "_comment": [')
+        for index, text in enumerate(comment):
+            comma = "," if index < len(comment) - 1 else ""
+            lines.append(f"    {_quote(str(text))}{comma}")
+        lines.append("  ],")
+    lines.append(f'  "version": {json.dumps(data.get("version", 1))},')
+    lines.append("")
+
+    families = [str(name).strip() for name in (data.get("families") or [])
+                if str(name).strip()]
+    lines.append('  "families": [')
+    lines.extend(_wrap_families(families))
+    lines.append("  ],")
+    lines.append("")
+
+    styles = [entry for entry in (data.get("styles") or []) if isinstance(entry, dict)]
+    lines.append('  "styles": [')
+    for index, entry in enumerate(styles):
+        comma = "," if index < len(styles) - 1 else ""
+        lines.append(f"    {_quote(entry)}{comma}")
+    lines.append("  ]")
+    lines.append("}")
+    return "\n".join(lines) + "\n"
+
+
+class VocabularyStore:
+    """Read/write ``data/styles.json``, the canonical style vocabulary.
+
+    Adding a style here only edits the vocabulary file. The caller must also
+    upsert the same entry into ``catalog.sqlite`` (see :meth:`ReviewApp.add_style`)
+    so the picker and the overrides can use it immediately.
+    """
+
+    def __init__(self, path: Path, backup_dir: Optional[Path] = None) -> None:
+        self.path = Path(path)
+        self.backup_dir = Path(backup_dir) if backup_dir else self.path.parent
+
+    def load(self) -> Dict[str, Any]:
+        if not self.path.exists():
+            raise ValueError(f"vocabulary not found: {self.path}")
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except ValueError as exc:
+            raise ValueError(f"{self.path} is not valid JSON: {exc}") from exc
+        if not isinstance(data, dict) or not isinstance(data.get("styles"), list):
+            raise ValueError(f"{self.path} must contain a 'styles' list")
+        if not isinstance(data.get("families"), list):
+            data["families"] = []
+        return data
+
+    def families(self) -> List[str]:
+        """Every family in the vocabulary (empty when the file is missing)."""
+        try:
+            return [str(name) for name in (self.load().get("families") or [])]
+        except ValueError:
+            return []
+
+    def styles(self) -> List[Dict[str, Any]]:
+        """Every style entry (empty when the file is missing)."""
+        try:
+            return [entry for entry in (self.load().get("styles") or [])
+                    if isinstance(entry, dict)]
+        except ValueError:
+            return []
+
+    @staticmethod
+    def _alias_keys(text: Any) -> List[str]:
+        """Both keys the pipeline uses, so an alias cannot become ambiguous."""
+        keys = [S.norm_key(text), normalize_raw(str(text or ""))]
+        return list(dict.fromkeys(key for key in keys if key))
+
+    @classmethod
+    def _keys(cls, entry: Dict[str, Any]) -> List[str]:
+        keys = cls._alias_keys(entry.get("name"))
+        for alias in (entry.get("aliases") or []):
+            keys.extend(cls._alias_keys(alias))
+        return list(dict.fromkeys(keys))
+
+    def _backup(self) -> Optional[Path]:
+        if not self.path.exists():
+            return None
+        self.backup_dir.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        target = self.backup_dir / f"{self.path.stem}.json.bak-{stamp}"
+        counter = 1
+        while target.exists():
+            target = self.backup_dir / f"{self.path.stem}.json.bak-{stamp}-{counter}"
+            counter += 1
+        shutil.copy2(self.path, target)
+        return target
+
+    def _write(self, data: Dict[str, Any]) -> None:
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        tmp.write_text(dump_vocabulary(data), encoding="utf-8")
+        os.replace(tmp, self.path)
+
+    def add(self, name: str, family: str, *, parent: str = "",
+            aliases: Sequence[str] = (),
+            reserved: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+        """Append one style in the documented format and return its entry.
+
+        ``reserved`` maps normalised names/aliases to a human description for
+        entries that exist only in the catalog (for example the automatic
+        ``Metal (unspecified)`` placeholders), so they cannot be duplicated.
+        """
+        data = self.load()
+        clean = S.style_display(name)
+        if not clean:
+            raise ValueError("A style needs a name.")
+        clean_family = S.style_display(family)
+        if not clean_family:
+            raise ValueError("Choose a family for the style.")
+
+        family_name = clean_family
+        new_family = True
+        for existing in data.get("families") or []:
+            if S.norm_key(existing) == S.norm_key(clean_family):
+                family_name = str(existing)
+                new_family = False
+                break
+
+        parent_name = ""
+        wanted_parent = S.norm_key(parent)
+        if wanted_parent:
+            for entry in data["styles"]:
+                if S.norm_key(entry.get("name")) != wanted_parent:
+                    continue
+                parent_name = str(entry.get("name"))
+                parent_family = S.norm_key(entry.get("family"))
+                if parent_family and parent_family != S.norm_key(family_name):
+                    raise ValueError(
+                        f"Parent style {parent_name!r} is in the "
+                        f"{entry.get('family')!r} family, not {family_name!r}.")
+                break
+            if not parent_name:
+                raise ValueError(
+                    f"Parent style {parent!r} is not in {self.path.name}. "
+                    "Run step3_vocabulary.py --build first.")
+            if S.norm_key(parent_name) == S.norm_key(clean):
+                raise ValueError("A style cannot be its own sub-style.")
+
+        name_keys = self._alias_keys(clean)
+        alias_list: List[str] = []
+        seen_aliases = set()
+        for alias in aliases or []:
+            text = str(alias).strip()
+            keys = self._alias_keys(text)
+            if not keys or any(key in name_keys for key in keys):
+                continue
+            if any(key in seen_aliases for key in keys):
+                continue
+            seen_aliases.update(keys)
+            alias_list.append(text)
+
+        # Names and aliases already owned by the vocabulary.
+        owned: Dict[str, str] = {}
+        for entry in data["styles"]:
+            entry_name = str(entry.get("name") or "").strip()
+            if not entry_name:
+                continue
+            for key in self._keys(entry):
+                owned.setdefault(key, entry_name)
+        slug = S.style_slug(clean)
+        for entry in data["styles"]:
+            if S.style_slug(entry.get("name")) == slug:
+                raise ValueError(
+                    f"A style named {entry.get('name')!r} already exists "
+                    f"({entry.get('family') or 'no family'}).")
+        for key in name_keys:
+            owner = owned.get(key)
+            if owner:
+                raise ValueError(f"{clean!r} is already used by the style {owner!r}.")
+        for alias in alias_list:
+            for key in self._alias_keys(alias):
+                owner = owned.get(key)
+                if owner:
+                    raise ValueError(
+                        f"{alias!r} is already used by the style {owner!r}.")
+
+        # Names that only the catalog knows (placeholders created by step 4).
+        reserved = reserved or {}
+        for key in name_keys:
+            if key in reserved:
+                raise ValueError(
+                    f"The catalog already contains {reserved[key]}.")
+        for alias in alias_list:
+            for key in self._alias_keys(alias):
+                if key in reserved:
+                    raise ValueError(
+                        f"{alias!r} is already used by {reserved[key]}")
+
+        entry: Dict[str, Any] = {"name": clean, "family": family_name}
+        if parent_name:
+            entry["parent"] = parent_name
+        entry["aliases"] = alias_list
+        data["styles"].append(entry)
+        if new_family:
+            data["families"].append(family_name)
+        self._backup()
+        self._write(data)
+        return entry
+
+
 class PreviewPlayer:
     """A tiny mpv preview process; no IPC and no state to break."""
 
@@ -254,6 +500,11 @@ class ReviewCatalog:
                 "SELECT id, name, family, parent, aliases, search_key, tracks"
                 " FROM styles ORDER BY family COLLATE NOCASE, name COLLATE NOCASE")]
         return self._styles
+
+    def reload_styles(self) -> List[Dict[str, Any]]:
+        """Drop the cached vocabulary (after a style was added)."""
+        self._styles = None
+        return self.styles()
 
     def style_names(self) -> Dict[str, str]:
         return {row["id"]: row["name"] for row in self.styles()}
@@ -411,6 +662,10 @@ class ReviewApp:
                          else S.resolve(S.setting(
                              config, "normalize.overrides_file", "data/overrides.json")))
         self.overrides = OverrideStore(override_file, backup_dir=self.catalog.out_dir)
+        vocabulary_file = S.resolve(S.setting(
+            config, "normalize.styles_file", "data/styles.json"))
+        self.vocabulary = VocabularyStore(vocabulary_file,
+                                          backup_dir=self.catalog.out_dir)
         # The pipeline helper reads this setting, so make it point at the same
         # file the GUI edits (the default is data/overrides.json anyway).
         normalize = dict(config.get("normalize") or {})
@@ -433,6 +688,7 @@ class ReviewApp:
         self.reload_queue()
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.root.bind("<Control-s>", lambda _event: self.save("tracks"))
+        self.root.bind("<Control-n>", lambda _event: self.open_new_style_dialog())
         self.root.bind("<F5>", lambda _event: self.preview_current())
         self.root.bind("<Escape>", lambda _event: self.preview.stop())
 
@@ -542,7 +798,12 @@ class ReviewApp:
 
         style_box = tk.Frame(pad, bg=CARD)
         style_box.pack(fill="both", expand=True, pady=(16, 0))
-        self._label(style_box, "Style — type to find", size=10, bold=True).pack(anchor="w")
+        style_header = tk.Frame(style_box, bg=CARD)
+        style_header.pack(fill="x")
+        self._label(style_header, "Style — type to find", size=10,
+                    bold=True).pack(side="left")
+        self._button(style_header, "New style…", self.open_new_style_dialog).pack(
+            side="right")
         search = tk.Entry(style_box, textvariable=self._style_query, bg=CARD_LIGHT,
                           fg=TEXT, insertbackground=TEXT, relief="flat",
                           font=(self.family, 11))
@@ -751,6 +1012,70 @@ class ReviewApp:
         self.filtered_styles: List[Dict[str, Any]] = []
         self._filter_styles()
 
+    def _family_values(self) -> List[str]:
+        """Families from both the vocabulary file and the catalog."""
+        families = set(self.vocabulary.families())
+        for style in self.catalog.styles():
+            family = str(style.get("family") or "").strip()
+            if family:
+                families.add(family)
+        return sorted(families, key=str.casefold)
+
+    def _catalog_reserved(self) -> Dict[str, str]:
+        """Names/aliases the catalog already knows but the vocabulary may not."""
+        reserved: Dict[str, str] = {}
+        for style in self.catalog.styles():
+            name = str(style.get("name") or "").strip()
+            if not name:
+                continue
+            description = f"{name!r}"
+            for key in VocabularyStore._alias_keys(name):
+                reserved.setdefault(key, description)
+            try:
+                aliases = json.loads(style.get("aliases") or "[]")
+            except ValueError:
+                aliases = []
+            for alias in aliases:
+                for key in VocabularyStore._alias_keys(alias):
+                    reserved.setdefault(key, description)
+        return reserved
+
+    def add_style(self, name: str, family: str, *, parent: str = "",
+                  aliases: Sequence[str] = ()) -> Dict[str, Any]:
+        """Add a canonical style to styles.json and the catalog.
+
+        Raises ``ValueError`` for invalid input and ``RuntimeError`` when the
+        vocabulary was written but the catalog could not be updated.
+        """
+        entry = self.vocabulary.add(name, family, parent=parent, aliases=aliases,
+                                    reserved=self._catalog_reserved())
+        try:
+            S.upsert_style(
+                self.catalog.connection, entry["name"],
+                family=entry.get("family"),
+                parent=S.style_slug(entry["parent"]) if entry.get("parent") else None,
+                aliases=entry.get("aliases") or [],
+                source="human")
+            self.catalog.connection.commit()
+        except Exception as exc:
+            self.catalog.connection.rollback()
+            raise RuntimeError(
+                f"{entry['name']!r} was added to {self.vocabulary.path.name}, "
+                f"but the catalog update failed: {exc}\n\n"
+                "Run: python3 styles/step3_vocabulary.py --build") from exc
+        self.catalog.reload_styles()
+        self._load_styles()
+        self._select_style_by_name(entry["name"])
+        details = entry.get("family") or "no family"
+        if entry.get("parent"):
+            details += f" · sub-style of {entry['parent']}"
+        self._status(f"Added {entry['name']!r} ({details}) to "
+                     f"{self.vocabulary.path.name} and the catalog · source human")
+        return entry
+
+    def open_new_style_dialog(self) -> None:
+        NewStyleDialog(self)
+
     @staticmethod
     def _style_display(style: Dict[str, Any]) -> str:
         family = style.get("family") or "—"
@@ -796,8 +1121,12 @@ class ReviewApp:
         self.selected_style = self.filtered_styles[index]
         tracks = self.selected_style.get("tracks")
         suffix = f" · {int(tracks):,} tracks" if isinstance(tracks, int) else ""
+        parent = str(self.selected_style.get("parent") or "")
+        parent_name = self.catalog.style_names().get(parent, parent)
+        hierarchy = f" · sub-style of {parent_name}" if parent_name else ""
         self.style_info.configure(
-            text=f"{self.selected_style['name']} — {self.selected_style.get('family') or '—'}{suffix}")
+            text=f"{self.selected_style['name']} — "
+                 f"{self.selected_style.get('family') or '—'}{hierarchy}{suffix}")
 
     def _select_first_style(self) -> None:
         if not self.filtered_styles:
@@ -991,6 +1320,135 @@ class ReviewApp:
                 self.catalog.close()
             finally:
                 self.root.destroy()
+
+
+class NewStyleDialog(tk.Toplevel):
+    """Modal form that adds one style to the vocabulary and the catalog."""
+
+    NONE = "(none)"
+
+    def __init__(self, app: ReviewApp) -> None:
+        super().__init__(app.root)
+        self.app = app
+        self.title("New style")
+        self.configure(bg=CARD)
+        self.resizable(False, False)
+        self.transient(app.root)
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.bind("<Escape>", lambda _event: self.destroy())
+        self._name_var = tk.StringVar()
+        self._family_var = tk.StringVar()
+        self._parent_var = tk.StringVar(value=self.NONE)
+        self._aliases_var = tk.StringVar()
+        self._build()
+        self._refresh_parents()
+        self._center()
+        try:
+            self.grab_set()
+        except tk.TclError:
+            pass
+        self.name_entry.focus_set()
+
+    def _build(self) -> None:
+        body = tk.Frame(self, bg=CARD, padx=18, pady=16)
+        body.pack(fill="both", expand=True)
+        self.app._label(body, "Add a canonical style", size=14,
+                        bold=True).pack(anchor="w")
+        self.app._label(
+            body,
+            "Appended to data/styles.json and loaded into the catalog "
+            "immediately (source human).",
+            size=9, color=MUTED).pack(anchor="w", pady=(2, 14))
+
+        self.app._label(body, "Family *", size=9, color=MUTED).pack(anchor="w")
+        self.family_box = ttk.Combobox(
+            body, textvariable=self._family_var, width=48,
+            values=self.app._family_values())
+        self.family_box.pack(fill="x", pady=(3, 2))
+        self.family_box.bind("<<ComboboxSelected>>",
+                             lambda _event: self._refresh_parents())
+        self.family_box.bind("<FocusOut>", lambda _event: self._refresh_parents())
+        self.app._label(body, "Type a new family to create it.",
+                        size=8, color=MUTED).pack(anchor="w", pady=(0, 10))
+
+        self.app._label(body, "Style name *", size=9, color=MUTED).pack(anchor="w")
+        self.name_entry = tk.Entry(
+            body, textvariable=self._name_var, bg=CARD_LIGHT, fg=TEXT,
+            insertbackground=TEXT, relief="flat", font=(self.app.family, 11))
+        self.name_entry.pack(fill="x", ipady=5, pady=(3, 10))
+        self.name_entry.bind("<Return>", lambda _event: self.save())
+
+        self.app._label(body, "Sub-style of (optional)", size=9,
+                        color=MUTED).pack(anchor="w")
+        self.parent_box = ttk.Combobox(
+            body, textvariable=self._parent_var, state="readonly", width=48)
+        self.parent_box.pack(fill="x", pady=(3, 2))
+        self.app._label(body,
+                        "A parent in the same family; shown as the finer hierarchy.",
+                        size=8, color=MUTED).pack(anchor="w", pady=(0, 10))
+
+        self.app._label(body, "Aliases (optional, comma-separated)",
+                        size=9, color=MUTED).pack(anchor="w")
+        self.alias_entry = tk.Entry(
+            body, textvariable=self._aliases_var, bg=CARD_LIGHT, fg=TEXT,
+            insertbackground=TEXT, relief="flat", font=(self.app.family, 11))
+        self.alias_entry.pack(fill="x", ipady=5, pady=(3, 2))
+        self.alias_entry.bind("<Return>", lambda _event: self.save())
+        self.app._label(body,
+                        "Spellings from file tags that should map to this style.",
+                        size=8, color=MUTED).pack(anchor="w", pady=(0, 12))
+
+        actions = tk.Frame(body, bg=CARD)
+        actions.pack(fill="x")
+        self.app._button(actions, "Cancel", self.destroy).pack(side="right")
+        self.app._button(actions, "Add style", self.save, accent=True).pack(
+            side="right", padx=(0, 8))
+
+    def _center(self) -> None:
+        self.update_idletasks()
+        parent = self.app.root
+        width = self.winfo_reqwidth()
+        height = self.winfo_reqheight()
+        x = parent.winfo_rootx() + max(0, (parent.winfo_width() - width) // 2)
+        y = parent.winfo_rooty() + max(0, (parent.winfo_height() - height) // 2)
+        self.geometry(f"+{x}+{y}")
+
+    def _parent_values(self) -> List[str]:
+        """Styles of the chosen family, as possible sub-style parents."""
+        family = S.norm_key(self._family_var.get())
+        names: List[str] = []
+        for style in self.app.catalog.styles():
+            name = str(style.get("name") or "").strip()
+            if not name or name.endswith("(unspecified)"):
+                continue
+            if family and S.norm_key(style.get("family")) != family:
+                continue
+            names.append(name)
+        return [self.NONE] + sorted(names, key=str.casefold)
+
+    def _refresh_parents(self) -> None:
+        values = self._parent_values()
+        self.parent_box.configure(values=values)
+        if self._parent_var.get() not in values:
+            self._parent_var.set(self.NONE)
+
+    def save(self) -> None:
+        parent = self._parent_var.get().strip()
+        if parent == self.NONE:
+            parent = ""
+        aliases = [part.strip() for part in re.split(r"[,;]", self._aliases_var.get())
+                   if part.strip()]
+        try:
+            self.app.add_style(self._name_var.get().strip(),
+                               self._family_var.get().strip(),
+                               parent=parent, aliases=aliases)
+        except ValueError as exc:
+            messagebox.showerror("Cannot add the style", str(exc), parent=self)
+            return
+        except Exception as exc:
+            messagebox.showerror("Could not add the style", str(exc), parent=self)
+            return
+        self.destroy()
 
 
 def list_queue(config: Dict[str, Any], mode: str, *, db_path: Optional[str],

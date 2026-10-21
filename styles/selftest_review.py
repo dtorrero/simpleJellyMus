@@ -48,8 +48,29 @@ def config_for(base: Path) -> Dict[str, Any]:
     config["music_root"] = str(base / "music")
     normalize = dict(config.get("normalize") or {})
     normalize["overrides_file"] = str(base / "overrides.json")
+    normalize["styles_file"] = str(base / "styles.json")
     config["normalize"] = normalize
     return config
+
+
+def write_vocabulary(config: Dict[str, Any]) -> None:
+    """A small, valid vocabulary that matches the fixture catalog."""
+    path = Path(config["normalize"]["styles_file"])
+    data = {
+        "_comment": ["fixture vocabulary for selftest_review.py"],
+        "version": 1,
+        "families": ["Metal", "Hardcore", "Hip Hop"],
+        "styles": [
+            {"name": "Deathcore", "family": "Hardcore", "aliases": ["deathcore"]},
+            {"name": "Metalcore", "family": "Hardcore", "aliases": ["metalcore"]},
+            {"name": "Death Metal", "family": "Metal",
+             "aliases": ["death metal", "death"]},
+            {"name": "Hip Hop", "family": "Hip Hop", "aliases": ["hip hop", "rap"]},
+            {"name": "Trap", "family": "Hip Hop", "aliases": ["trap"]},
+            {"name": "Rap Metal", "family": "Metal", "aliases": ["rap metal", "rapcore"]},
+        ],
+    }
+    path.write_text(R.dump_vocabulary(data), encoding="utf-8")
 
 
 def insert_track(connection, *, rel_path: str, name: str, artist: str, album: str,
@@ -255,6 +276,71 @@ def test_apply(report: Reporter, config: Dict[str, Any]) -> None:
         catalog.close()
 
 
+def test_vocabulary(report: Reporter, config: Dict[str, Any]) -> None:
+    print("\nVocabularyStore")
+    fixture = Path(config["normalize"]["styles_file"])
+    path = fixture.with_name("vocabulary-test.json")
+    shutil.copy2(fixture, path)
+    store = R.VocabularyStore(path, backup_dir=Path(config["out_dir"]))
+
+    def rejected(label: str, action: Any) -> None:
+        try:
+            action()
+        except ValueError:
+            report.check(label, True)
+        else:
+            report.check(label, False, "no ValueError")
+
+    entry = store.add("Melodic Death Metal", "metal", parent="death metal",
+                      aliases=["melodeath", "MDM", "melodeath",
+                               "Melodic Death Metal"])
+    report.check("a style is stored in the existing format",
+                 entry == {"name": "Melodic Death Metal", "family": "Metal",
+                           "parent": "Death Metal",
+                           "aliases": ["melodeath", "MDM"]},
+                 repr(entry))
+    data = store.load()
+    report.check("the new style is the last vocabulary entry",
+                 data["styles"][-1] == entry)
+    report.check("existing vocabulary entries are preserved",
+                 [style["name"] for style in data["styles"][:6]]
+                 == ["Deathcore", "Metalcore", "Death Metal", "Hip Hop",
+                     "Trap", "Rap Metal"])
+
+    added = store.add("Breakcore", "electronic", aliases=["breakcore"])
+    report.check("a new family is appended to the families list",
+                 added["family"] == "Electronic" and "Electronic" in store.families(),
+                 repr(added))
+
+    text = path.read_text(encoding="utf-8")
+    style_lines = [line for line in text.splitlines()
+                   if line.strip().startswith('{"name"')]
+    report.check("styles stay one per line",
+                 len(style_lines) == len(store.load()["styles"]),
+                 f"{len(style_lines)} lines, {len(store.load()['styles'])} styles")
+    report.check("a backup was written before overwriting",
+                 bool(list(Path(config["out_dir"]).glob("vocabulary-test.json.bak-*"))))
+    report.check("no .tmp file is left behind",
+                 not path.with_name(path.name + ".tmp").exists())
+
+    rejected("a duplicate style name is rejected",
+             lambda: store.add("melodic death metal", "Metal"))
+    rejected("an alias owned by another style is rejected",
+             lambda: store.add("War Metal", "Metal", aliases=["death"]))
+    rejected("a parent outside the vocabulary is rejected",
+             lambda: store.add("War Metal", "Metal", parent="Black Metal"))
+    rejected("a parent in another family is rejected",
+             lambda: store.add("War Metal", "Hardcore", parent="Death Metal"))
+    rejected("a style cannot be its own sub-style",
+             lambda: store.add("Death Metal", "Metal", parent="Death Metal"))
+    rejected("a catalog-only placeholder is rejected",
+             lambda: store.add("Metal (unspecified)", "Metal",
+                               reserved={"metal unspecified": "'Metal (unspecified)'"}))
+    store.add("Rhythm and Blues", "Hip Hop", aliases=["R&B"])
+    rejected("an alias that only collides after tag normalisation is rejected",
+             lambda: store.add("RnB", "Hip Hop", aliases=["R B"]))
+
+
 def test_gui(report: Reporter, config: Dict[str, Any]) -> None:
     print("\nGUI smoke test")
     try:
@@ -287,6 +373,69 @@ def test_gui(report: Reporter, config: Dict[str, Any]) -> None:
         labels = _labels(app.catalog, "Band/Album/01 - Corruption.mp3")
         report.check("the GUI leaves only the manual label with exclusive on",
                      set(labels) == {"Deathcore"}, ", ".join(labels))
+
+        added = app.add_style("Melodic Death Metal", "Metal",
+                              parent="Death Metal", aliases=["melodeath", "mdm"])
+        row = app.catalog.connection.execute(
+            "SELECT name, family, parent, aliases, source FROM styles WHERE id=?",
+            ("melodic-death-metal",)).fetchone()
+        report.check("the GUI adds a style to the catalog",
+                     row is not None and row["name"] == "Melodic Death Metal"
+                     and row["family"] == "Metal" and row["parent"] == "death-metal"
+                     and row["source"] == "human",
+                     str(tuple(row)) if row else "missing")
+        report.check("the new style is in the vocabulary file",
+                     any(style["name"] == "Melodic Death Metal"
+                         for style in app.vocabulary.styles()))
+        report.check("the GUI selects the style it just added",
+                     app.selected_style is not None
+                     and app.selected_style["name"] == added["name"],
+                     str((app.selected_style or {}).get("name")))
+        report.check("the style info shows the sub-style parent",
+                     "sub-style of Death Metal" in app.style_info.cget("text"),
+                     app.style_info.cget("text"))
+        saved = json.loads(Path(config["normalize"]["styles_file"]).read_text())
+        report.check("the new style is appended to styles.json",
+                     saved["styles"][-1] == {"name": "Melodic Death Metal",
+                                             "family": "Metal",
+                                             "parent": "Death Metal",
+                                             "aliases": ["melodeath", "mdm"]},
+                     repr(saved["styles"][-1]))
+        # The first save removed the track from the "No style" queue, so pick
+        # it again from the full list before saving the new style.
+        app._mode.set(R.QUEUE_LABELS["all"])
+        app.reload_queue()
+        index = next(position for position, candidate in enumerate(app.rows)
+                     if candidate["rel_path"] == "Band/Album/01 - Corruption.mp3")
+        app.queue_list.selection_clear(0, "end")
+        app.queue_list.selection_set(index)
+        app.queue_list.activate(index)
+        app._on_queue_select()
+        app._select_style_by_name("Melodic Death Metal")
+        app.save("tracks")
+        row = app.catalog.connection.execute(
+            "SELECT primary_style, label_source FROM tracks WHERE rel_path=?",
+            ("Band/Album/01 - Corruption.mp3",)).fetchone()
+        report.check("the newly added style can be saved to a track",
+                     row is not None
+                     and tuple(row) == ("melodic-death-metal", "human"),
+                     str(tuple(row)) if row else "missing")
+
+        dialog = R.NewStyleDialog(app)
+        root.update()
+        report.check("the new-style dialog lists the family choices",
+                     len(dialog.family_box["values"]) >= 3,
+                     str(dialog.family_box["values"]))
+        dialog._family_var.set("Metal")
+        dialog._refresh_parents()
+        offered = set(dialog.parent_box["values"])
+        expected = {"(none)"} | {
+            str(style["name"]) for style in app.catalog.styles()
+            if style.get("family") == "Metal"
+            and not str(style["name"]).endswith("(unspecified)")}
+        report.check("the dialog offers only the selected family as parents",
+                     offered == expected, str(sorted(offered ^ expected)))
+        dialog.destroy()
     finally:
         if app is not None:
             app.close()
@@ -297,12 +446,14 @@ def test_gui(report: Reporter, config: Dict[str, Any]) -> None:
 def main() -> int:
     report = Reporter()
     config = config_for(TMP)
+    write_vocabulary(config)
     build_catalog(config)
     try:
         for label, function in (
                 ("OverrideStore", test_store),
                 ("ReviewCatalog", test_catalog),
                 ("Apply overrides", test_apply),
+                ("VocabularyStore", test_vocabulary),
                 ("GUI smoke test", test_gui)):
             try:
                 function(report, config)
