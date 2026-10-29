@@ -130,12 +130,12 @@ DISCORD_DEFAULTS: Dict[str, Any] = {
     "enabled": True,
     "client_id": "",
     "cover": False,
-    "cover_host": "litterbox",
+    "cover_host": "uguu",
     "cover_expiry": "72h",
     "activity_type": 2,
     "status_display_type": 2,
 }
-DISCORD_HOSTS = ("litterbox", "catbox")
+DISCORD_HOSTS = ("uguu", "litterbox", "catbox")
 # The fields Discord can put into the status text, by the name Discord uses for
 # them; the index in this tuple is the value of ``status_display_type``.
 STATUS_DISPLAY_NAMES = ("name", "state", "details")

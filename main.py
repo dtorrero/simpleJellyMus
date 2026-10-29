@@ -334,7 +334,7 @@ class Application:
         cover = None
         if self.discord.get("cover"):
             cover = discord_cover.CoverUploader(
-                host=str(self.discord.get("cover_host") or "litterbox"),
+                host=str(self.discord.get("cover_host") or "uguu"),
                 expiry=str(self.discord.get("cover_expiry") or "72h"),
                 debug=self.debug)
         try:

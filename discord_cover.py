@@ -7,15 +7,20 @@ either an asset key uploaded to the application in the Discord Developer Portal
 that Discord fetches itself. This module produces such a URL for the cover that
 is already in the local cache.
 
-It uploads to `litterbox <https://litterbox.catbox.moe/>`_ - anonymous, no
-account, and the file is deleted again after the chosen lifetime (three days by
-default) - and falls back to `catbox <https://catbox.moe/>` if that fails. Both
-are third parties, which is exactly why this is opt-in (``--discord-cover``):
-what leaves the machine is a downscaled copy of the album art and nothing else,
-no account, no name, no listening history. Nothing is uploaded unless you ask
-for it, nothing is uploaded twice (the URL is remembered per cover file in
-``~/.cache/simplejellymus/discord_covers.json``), and any failure simply leaves
-the static image in place.
+It uploads to `uguu <https://uguu.se/>`_ - anonymous, no account, and the file
+is deleted again after three hours - and falls back to `catbox
+<https://catbox.moe/>`_ and `litterbox <https://litterbox.catbox.moe/>`_ when
+that fails. All three are third parties, which is exactly why this is opt-in
+(``--discord-cover``): what leaves the machine is a downscaled copy of the album
+art and nothing else, no account, no name, no listening history. Nothing is
+uploaded unless you ask for it, nothing is uploaded twice (the URL is remembered
+per cover file in ``~/.cache/simplejellymus/discord_covers.json``), and any
+failure simply leaves the static image in place.
+
+Why uguu first: Discord does not load these URLs itself, its media proxy fetches
+them, and catbox/litterbox (the same provider) often answer that proxy with 502
+for minutes - the profile shows a "?" until a late retry happens to succeed.
+uguu answers the proxy immediately.
 """
 
 from __future__ import annotations
@@ -33,10 +38,52 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-# The two anonymous image hosts and their upload endpoints. Litterbox deletes
-# the file by itself, catbox keeps it (which is why litterbox is the default).
+# The anonymous image hosts and their upload endpoints. uguu deletes the file
+# after three hours; catbox keeps it (which is why it is the fallback) and
+# litterbox deletes it after the configured lifetime.
+UGUU_API = "https://uguu.se/upload.php"
 LITTERBOX_API = "https://litterbox.catbox.moe/resources/internals/api.php"
 CATBOX_API = "https://catbox.moe/user/api.php"
+
+# What every host needs: where to post, which field carries the file, which
+# extra fields it wants, and how long it keeps the file (``None`` = forever).
+# ``json`` means the answer is ``{"files": [{"url": ...}]}`` instead of a bare
+# URL. ``verify`` rejects an upload whose URL does not answer with image bytes.
+HOSTS: Dict[str, Dict[str, Any]] = {
+    "uguu": {
+        "endpoint": UGUU_API,
+        "fields": {},
+        "file_field": "files[]",
+        "lifetime": 3 * 3600,
+        "json": True,
+    },
+    "catbox": {
+        "endpoint": CATBOX_API,
+        "fields": {"reqtype": "fileupload"},
+        "file_field": "fileToUpload",
+        "lifetime": None,
+        "json": False,
+    },
+    "litterbox": {
+        "endpoint": LITTERBOX_API,
+        "fields": {"reqtype": "fileupload"},
+        "file_field": "fileToUpload",
+        "lifetime": None,
+        "json": False,
+        "expiry_field": "time",
+    },
+}
+# uguu first: Discord's media proxy fetches it right away, while catbox and
+# litterbox (the same provider) often answer the proxy with 502 for minutes.
+DEFAULT_HOST = "uguu"
+# The order the fallbacks are tried in when the configured host fails.
+HOST_ORDER = ("uguu", "catbox", "litterbox")
+# A remembered URL older than this is checked once before it is reused, so a
+# file a host removed early never ends up as a broken image in the profile.
+RECHECK_AFTER = 600.0
+# What a successful upload hands back: the URL, the host that answered, and how
+# long that host keeps the file (``None`` = forever).
+Uploaded = Tuple[str, str, Optional[float]]
 
 # Where the URLs are remembered, next to the other caches (the same path
 # jellyfin.py uses, spelled out to keep this module independent of it).
@@ -104,6 +151,20 @@ def _lifetime(value: Any) -> Optional[float]:
     return float(match.group(1)) * _EXPIRY_UNITS[match.group(2).lower()]
 
 
+def _json_url(value: Any) -> Optional[str]:
+    """The public URL out of an uguu-style answer (``files[0].url``)."""
+    try:
+        data = json.loads(str(value or ""))
+    except ValueError:
+        return None
+    files = data.get("files") if isinstance(data, dict) else None
+    if not isinstance(files, list) or not files:
+        return None
+    item = files[0]
+    url = item.get("url") if isinstance(item, dict) else item
+    return str(url) if _public_url(url) else None
+
+
 class CoverUploader:
     """Turns a local cover file into a public URL, once per file.
 
@@ -111,16 +172,21 @@ class CoverUploader:
     never the engine, so an unreachable image host cannot hold up playback.
     """
 
-    def __init__(self, *, host: str = "litterbox", expiry: str = DEFAULT_EXPIRY,
+    def __init__(self, *, host: str = DEFAULT_HOST, expiry: str = DEFAULT_EXPIRY,
                  endpoint: Optional[str] = None, cache_file: Optional[Any] = None,
                  max_size: int = DEFAULT_MAX_SIZE, quality: int = DEFAULT_QUALITY,
                  timeout: float = DEFAULT_TIMEOUT, spacing: float = DEFAULT_SPACING,
-                 fallback: bool = True, debug: bool = False) -> None:
-        self.host = "catbox" if str(host).lower() == "catbox" else "litterbox"
+                 fallback: bool = True, verify: bool = True,
+                 debug: bool = False) -> None:
+        requested = str(host or "").strip().lower()
+        self.host = requested if requested in HOSTS else DEFAULT_HOST
         self.expiry = str(expiry or DEFAULT_EXPIRY)
-        # An own endpoint (the self-test uses one) replaces both hosts.
+        # An own endpoint (the self-test uses one) replaces the real hosts.
         self.endpoint = str(endpoint) if endpoint else None
         self.fallback = bool(fallback) and self.endpoint is None
+        # The self-test's own endpoint does not serve the URLs it reports, so
+        # checking those would only test the network of the test machine.
+        self.verify = bool(verify) and self.endpoint is None
         self.cache_file = Path(cache_file) if cache_file else URL_CACHE_FILE
         self.max_size = max(64, int(max_size))
         self.quality = max(1, min(95, int(quality)))
@@ -153,15 +219,17 @@ class CoverUploader:
         if prepared is None:
             return None
         try:
-            url = self._upload(prepared, is_cancelled)
+            published = self._upload(prepared, is_cancelled)
         finally:
             if prepared != source:
                 try:
                     prepared.unlink()
                 except OSError:
                     pass
-        if url:
-            self._remember(key, url)
+        if published is None:
+            return None
+        url, host, lifetime = published
+        self._remember(key, url, host, lifetime)
         return url
 
     # ------------------------------------------------------------------- helpers
@@ -220,54 +288,81 @@ class CoverUploader:
             return path
 
     # -------------------------------------------------------------------- upload
-    def _upload(self, path: Path, is_cancelled: Optional[Callable[[], bool]]) -> Optional[str]:
-        """Try the configured host, then the fallback; the first URL wins."""
-        for name, endpoint in self._attempts():
+    def _upload(self, path: Path,
+                is_cancelled: Optional[Callable[[], bool]]) -> Optional[Uploaded]:
+        """Try the configured host, then the fallbacks; the first URL wins."""
+        for name in self._attempts():
             if is_cancelled is not None and is_cancelled():
                 return None
             self._wait_for_slot()
-            fields = {"reqtype": "fileupload"}
-            if name == "litterbox":
-                fields["time"] = self.expiry
-            url = self._post(endpoint, fields, path, name)
+            config = HOSTS[name]
+            fields = dict(config["fields"])
+            if config.get("expiry_field"):
+                fields[config["expiry_field"]] = self.expiry
+            endpoint = self.endpoint or str(config["endpoint"])
+            url = self._post(endpoint, fields, path, name, config)
             if url:
-                return url
+                lifetime = config.get("lifetime")
+                if lifetime is None and config.get("expiry_field"):
+                    lifetime = _lifetime(self.expiry)
+                return url, name, lifetime
         return None
 
-    def _attempts(self) -> List[Tuple[str, str]]:
-        """``(host name, endpoint)`` pairs to try, in order."""
-        if self.endpoint is not None:
-            return [(self.host, self.endpoint)]
-        if self.host == "catbox":
-            return [("catbox", CATBOX_API)]
-        attempts = [("litterbox", LITTERBOX_API)]
-        if self.fallback:
-            attempts.append(("catbox", CATBOX_API))
-        return attempts
+    def _attempts(self) -> List[str]:
+        """The hosts to try, in order (the configured one always comes first)."""
+        if self.endpoint is not None or not self.fallback:
+            return [self.host]
+        return [self.host] + [name for name in HOST_ORDER if name != self.host]
 
-    def _post(self, endpoint: str, fields: Dict[str, str], path: Path, host: str) -> Optional[str]:
+    def _post(self, endpoint: str, fields: Dict[str, str], path: Path, host: str,
+              config: Dict[str, Any]) -> Optional[str]:
         """One multipart upload; returns the public URL the host reports."""
         try:
-            body, content_type = _multipart(fields, "fileToUpload", path)
+            body, content_type = _multipart(fields, str(config["file_field"]), path)
         except OSError as exc:
             self._log(f"cannot read {path.name}: {exc}")
             return None
         request = urllib.request.Request(
             endpoint, data=body, method="POST",
             headers={"Content-Type": content_type, "User-Agent": USER_AGENT,
-                     "Accept": "text/plain"})
+                     "Accept": "*/*"})
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 answer = response.read().decode("utf-8", "replace").strip()
         except (urllib.error.URLError, OSError, ValueError) as exc:
             self._log(f"{host} upload failed: {exc}")
             return None
-        if not _public_url(answer):
+        url = _json_url(answer) if config.get("json") else (
+            answer if _public_url(answer) else None)
+        if not url:
             self._log(f"{host} answered with something unexpected: {answer[:120]!r}")
             return None
+        if self.verify and not self._verify(url):
+            self._log(f"{host} uploaded the artwork but does not serve it - trying another host")
+            return None
         self.uploads += 1
-        self._log(f"artwork published on {host}: {answer}")
-        return answer
+        self._log(f"artwork published on {host}: {url}")
+        return url
+
+    def _verify(self, url: str) -> bool:
+        """True only when *url* answers with image bytes right now.
+
+        The User-Agent matters: catbox resets connections from Python's default
+        agent, so the check has to look like the application, not like urllib.
+        """
+        request = urllib.request.Request(url, headers={
+            "User-Agent": USER_AGENT, "Accept": "image/*", "Range": "bytes=0-1023"})
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                content_type = str(response.headers.get("Content-Type") or "").lower()
+                data = response.read(1024)
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            self._log(f"the uploaded artwork is not reachable: {exc}")
+            return False
+        if not data or not content_type.startswith("image/"):
+            self._log(f"the uploaded artwork is not an image ({content_type or 'no type'})")
+            return False
+        return True
 
     def _wait_for_slot(self) -> None:
         """Keep at least *spacing* seconds between two uploads to the same host."""
@@ -292,18 +387,46 @@ class CoverUploader:
         entry = self._urls.get(key)
         if not isinstance(entry, dict) or not _public_url(entry.get("url")):
             return None
-        if entry.get("host") != "catbox" and self._expired(entry):
-            # Litterbox deletes the file after its lifetime, and a URL that no
+        url = str(entry["url"])
+        host = str(entry.get("host") or "")
+        # Older cache files recorded the *configured* host, so a catbox
+        # fallback was saved as "litterbox"; the URL itself tells the truth.
+        if "//files.catbox.moe/" in url:
+            host = "catbox"
+        if host != self.host:
+            # The user asked for another host (or a fallback published this
+            # one); upload there instead of reusing a URL from somewhere else.
+            return None
+        if host != "catbox" and self._expired(entry):
+            # The host deletes the file after its lifetime, and a URL that no
             # longer resolves would put a broken image into the profile.
             with self._lock:
                 self._urls.pop(key, None)
             self._persist()
             return None
-        return str(entry["url"])
+        try:
+            uploaded = float(entry.get("uploaded") or 0)
+        except (TypeError, ValueError):
+            uploaded = 0.0
+        if self.verify and uploaded and time.time() - uploaded > RECHECK_AFTER:
+            # It may have been deleted early or the host may have moved it;
+            # one cheap check beats a broken image in the profile.
+            if not self._verify(url):
+                with self._lock:
+                    self._urls.pop(key, None)
+                self._persist()
+                return None
+        return url
 
     def _expired(self, entry: Dict[str, Any]) -> bool:
-        lifetime = _lifetime(entry.get("expiry"))
-        if not lifetime:
+        lifetime = entry.get("lifetime")
+        if lifetime is None:
+            lifetime = _lifetime(entry.get("expiry"))
+        try:
+            lifetime = float(lifetime)
+        except (TypeError, ValueError):
+            return False
+        if lifetime <= 0:
             return False
         try:
             uploaded = float(entry.get("uploaded") or 0)
@@ -313,10 +436,16 @@ class CoverUploader:
         # track starts, and the file may already be gone a little earlier.
         return time.time() > uploaded + lifetime * 0.5
 
-    def _remember(self, key: str, url: str) -> None:
+    def _remember(self, key: str, url: str, host: str,
+                  lifetime: Optional[float]) -> None:
         with self._lock:
-            self._urls[key] = {"url": url, "host": self.host, "expiry": self.expiry,
-                               "uploaded": int(time.time())}
+            entry: Dict[str, Any] = {"url": url, "host": host,
+                                     "uploaded": int(time.time())}
+            if lifetime:
+                entry["lifetime"] = int(lifetime)
+            if host == "litterbox":
+                entry["expiry"] = self.expiry
+            self._urls[key] = entry
             self._prune()
             self._persist()
 

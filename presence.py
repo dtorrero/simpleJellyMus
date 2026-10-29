@@ -65,6 +65,11 @@ DEFAULT_ASSETS = {"logo": "logo", "playing": "playing", "paused": "paused"}
 # Discord is rate limited about SET_ACTIVITY; one frame every two seconds is far
 # below anything it complains about, and only real changes are ever sent.
 MIN_UPDATE_INTERVAL = 2.0
+# A cover upload that failed is tried once more while the track is still young:
+# image hosts have bad moments, and one lost picture is one too many. The second
+# try waits a little, so it does not hit the same moment.
+COVER_ATTEMPTS = 2
+COVER_RETRY_DELAY = 20.0
 # A jump larger than this many seconds is a seek and worth an update - plain
 # progress is not, Discord advances the clock from the timestamps itself.
 POSITION_TOLERANCE = 5.0
@@ -457,7 +462,7 @@ class DiscordPresence:
         self._last_state: Optional[Dict[str, Any]] = None
         self._cover_url: Optional[str] = None
         self._cover_track: Optional[str] = None    # the track *cover_url* belongs to
-        self._cover_tried: Optional[str] = None    # the track whose artwork failed
+        self._cover_tries: Dict[str, Any] = {}     # track -> (attempts, last monotonic)
 
     def _log(self, message: str) -> None:
         if self.debug:
@@ -651,14 +656,20 @@ class DiscordPresence:
         """Upload the artwork of the current track, then publish it.
 
         Runs on the worker thread, after the track itself is already on Discord,
-        so a slow or broken image host only costs the picture. Every track is
-        tried exactly once; a failure simply keeps the static image.
+        so a slow or broken image host only costs the picture. A failure is tried
+        once more a little later; after that the static image stays.
         """
         if self._cover is None or self._cover_provider is None:
             return
         track = self._track_key(state)
-        if not track or track in (self._cover_track, self._cover_tried):
+        if not track or track == self._cover_track:
             return
+        tries, last = self._cover_tries.get(track, (0, 0.0))
+        now = time.monotonic()
+        if tries >= COVER_ATTEMPTS or (tries and now - last < COVER_RETRY_DELAY):
+            return
+        self._cover_tries[track] = (tries + 1, now)
+        self._prune_cover_tries()
         item = state.get("current") or {}
         path: Optional[Any] = None
         try:
@@ -672,13 +683,20 @@ class DiscordPresence:
             except Exception as exc:
                 self._log(f"cover upload failed: {exc}")
         if not url:
-            self._cover_tried = track
-            self._log("no artwork published for this track - the static image stays")
+            self._log("no artwork published for this track (yet) - the static image stays")
             return
         self._cover_url = url
         self._cover_track = track
+        self._cover_tries.pop(track, None)
         self._sent = None                  # publish the same track again, with art
         with self._lock:
             if self._pending is None:
                 self._pending = state
         self._wake.set()
+
+    def _prune_cover_tries(self) -> None:
+        """Remember only the newest tracks, so a long session cannot grow."""
+        if len(self._cover_tries) <= 20:
+            return
+        for key in list(self._cover_tries)[:-20]:
+            self._cover_tries.pop(key, None)

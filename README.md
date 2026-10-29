@@ -435,17 +435,22 @@ python3 main.py --discord-client-id 1234567890123456789
 Discord downloads a rich-presence picture from a URL, so the cover has to be
 reachable from the internet first. With `--discord-cover` the player uploads a
 **downscaled copy** (at most 512 px, JPEG) of the artwork it already has in
-`~/.cache/simplejellymus/covers/` to
-[litterbox.catbox.moe](https://litterbox.catbox.moe/) - a free, anonymous file
-host: no account, no name, nothing but the picture - and hands the resulting URL
-to Discord.
+`~/.cache/simplejellymus/covers/` to [uguu.se](https://uguu.se/) - a free,
+anonymous file host: no account, no name, nothing but the picture - and hands
+the resulting URL to Discord.
 
-* The upload **deletes itself after 72 hours**; while it exists, anyone who has
-  the URL could look at your album cover. That is why this is opt-in.
+* The upload **deletes itself after three hours**; while it exists, anyone who
+  has the URL could look at your album cover. That is why this is opt-in.
 * Every cover is uploaded **once per file**: the URL is remembered in
   `~/.cache/simplejellymus/discord_covers.json` (mode `600`) and reused, also
   after a restart. `{"discord": {"cover_host": "catbox"}}` keeps the file at
-  catbox.moe permanently instead, and `"cover_expiry"` changes the 72h lifetime.
+  catbox.moe permanently instead; `"cover_host": "litterbox"` uses litterbox
+  again and `"cover_expiry"` changes its 72h lifetime.
+* Why uguu is the default: Discord does not download the URL itself, its
+  **media proxy** does, and catbox/litterbox (the same provider) often answer
+  that proxy with `502` for minutes. The profile then shows a "?" until a late
+  retry happens to succeed - which can take ten minutes. uguu answers the proxy
+  immediately. If uguu is unreachable, the other two are tried as fallbacks.
 * The track reaches Discord **before** the upload has finished (with the static
   `logo`); the artwork replaces it a moment later. A slow or broken host costs
   the picture and nothing else, and it never touches playback: the upload happens
@@ -610,7 +615,7 @@ tiny one.
 
 | Path | Content |
 |---|---|
-| `~/.config/simplejellymus/config.json` | server URL, username, access token, user id, device id, volume, window mode and size, the style filter picked with `G`, and the `discord` block (on/off, client id, cover art, and how the presence is worded: `activity_type`, `status_display_type`) |
+| `~/.config/simplejellymus/config.json` | server URL, username, access token, user id, device id, volume, window mode and size, the style filter picked with `G`, and the `discord` block (on/off, client id, cover art and its host, and how the presence is worded: `activity_type`, `status_display_type`) |
 | `~/.cache/simplejellymus/audio/` | preloaded (next) tracks, pruned automatically |
 | `~/.cache/simplejellymus/covers/` | album art cache |
 | `~/.cache/simplejellymus/discord_covers.json` | the URLs of the covers uploaded for the Discord presence (`--discord-cover`), one per cover file, mode `600` |
@@ -657,7 +662,8 @@ simply plays random songs - a stale config never keeps the music from starting.
 | Discord's member list says "Jellyfin RP" instead of the song | that is the status text falling back to the application name: `"status_display_type": 2` is the default and asks for the track title (`0` would ask for the app name, `1` for artist and album) |
 | Discord says "Playing <song>" instead of "Listening to <song>" | the config file asks for it with `"activity_type": 0`; delete that key (or set it to `2`) for the music wording and the time bar |
 | Discord shows "Jellyfin" instead of your own name and images | that is the borrowed application id - pass `--discord-client-id` with your own application, see [Discord Rich Presence](#discord-rich-presence) |
-| Discord still shows the static logo instead of the cover | `--discord-cover` was not given, or litterbox.catbox.moe could not be reached; `--debug` prints `[discord] artwork published ...` or why it did not |
+| Discord still shows the static logo instead of the cover | `--discord-cover` was not given, or uguu.se/catbox.moe could not be reached; `--debug` prints `[discord] artwork published on uguu: ...` or why it did not |
+| The cover shows a "?" for minutes, then appears | that is Discord's media proxy failing to fetch catbox/litterbox: it shows a placeholder until a late retry succeeds. uguu.se is the default for exactly that reason (`{"discord": {"cover_host": "catbox"}}` switches back, `"cover_expiry"` applies to litterbox) |
 
 ## Remote control (scripts, KDE shortcuts, Stream Deck)
 

@@ -196,11 +196,12 @@ def start_server():
 
 
 class FakeImageHost(BaseHTTPRequestHandler):
-    """A stand-in for litterbox/catbox: answers an upload with a public URL.
+    """A stand-in for the image hosts: answers an upload with a public URL.
 
-    The class attributes configure the next answer - a URL, an HTTP error, a
-    body that is not a URL at all, or a slow reply (which is how the test sees
-    that a track reaches Discord before its artwork does).
+    The class attributes configure the next answer - a URL (or a JSON document,
+    for uguu), an HTTP error, a body that is not a URL at all, or a slow reply
+    (which is how the test sees that a track reaches Discord before its artwork
+    does).
     """
 
     protocol_version = "HTTP/1.1"
@@ -1271,7 +1272,7 @@ def test_discord_presence(report: Reporter, client: JellyfinClient) -> None:
     defaults = jellyfin.discord_config({})
     report.check("rich presence is on by default, cover art is not",
                  defaults == {"enabled": True, "client_id": "", "cover": False,
-                              "cover_host": "litterbox", "cover_expiry": "72h",
+                              "cover_host": "uguu", "cover_expiry": "72h",
                               "activity_type": 2, "status_display_type": 2}, str(defaults))
     report.check("... and it reads as music: \"Listening to <track title>\"",
                  defaults["activity_type"] == 2
@@ -1289,12 +1290,12 @@ def test_discord_presence(report: Reporter, client: JellyfinClient) -> None:
                                                       "activity_type": "loud",
                                                       "status_display_type": "loud"}})
                  == {"enabled": False, "cover": True, "client_id": "42",
-                     "cover_host": "litterbox", "cover_expiry": "72h",
+                     "cover_host": "uguu", "cover_expiry": "72h",
                      "activity_type": 2, "status_display_type": 2})
     report.check("a discord block that sets nothing else keeps both wording defaults",
                  jellyfin.discord_config({"discord": {"enabled": True}})
                  == {"enabled": True, "client_id": "", "cover": False,
-                     "cover_host": "litterbox", "cover_expiry": "72h",
+                     "cover_host": "uguu", "cover_expiry": "72h",
                      "activity_type": 2, "status_display_type": 2},
                  str(jellyfin.discord_config({"discord": {"enabled": True}})))
     report.check("the status text field can be spelled the way Discord spells it",
@@ -1521,7 +1522,8 @@ def test_discord_presence(report: Reporter, client: JellyfinClient) -> None:
         cover_file.write_bytes(COVER_BYTES)
         public = "https://litter.catbox.moe/selftest.png"
         FakeImageHost.reset(public)
-        uploader = discord_cover.CoverUploader(endpoint=endpoint, cache_file=_TMP / "covers.json",
+        uploader = discord_cover.CoverUploader(host="litterbox", endpoint=endpoint,
+                                               cache_file=_TMP / "covers.json",
                                                max_size=128, spacing=0.0)
         report.check("the artwork is uploaded and its public URL comes back",
                      uploader.url_for(cover_file) == public, str(uploader.url_for(cover_file)))
@@ -1539,24 +1541,55 @@ def test_discord_presence(report: Reporter, client: JellyfinClient) -> None:
                      uploader.url_for(cover_file) == public and len(FakeImageHost.requests) == 1,
                      f"{len(FakeImageHost.requests)} request(s)")
         report.check("the URL is remembered for the next start",
-                     discord_cover.CoverUploader(endpoint=endpoint, cache_file=_TMP / "covers.json",
+                     discord_cover.CoverUploader(host="litterbox", endpoint=endpoint,
+                                                 cache_file=_TMP / "covers.json",
                                                  spacing=0.0).url_for(cover_file) == public
                      and len(FakeImageHost.requests) == 1)
         report.check("a cover that is not a file is not uploaded",
                      uploader.url_for(_TMP / "no-such-cover.jpg") is None
                      and uploader.url_for(None) is None)
 
+        uguu_answer = ('{"success": true, "files": [{"url": "https://h.uguu.se/self.jpg"}]}')
+        FakeImageHost.reset(uguu_answer)
+        uguu = discord_cover.CoverUploader(host="uguu", endpoint=endpoint,
+                                           cache_file=_TMP / "uguu.json",
+                                           max_size=128, spacing=0.0)
+        report.check("uguu is the default host and its JSON URL is understood",
+                     discord_cover.DEFAULT_HOST == "uguu"
+                     and uguu.url_for(cover_file) == "https://h.uguu.se/self.jpg")
+        uguu_body = (FakeImageHost.requests[0].get("body") or b"") if FakeImageHost.requests else b""
+        report.check("uguu is sent the file field it expects",
+                     b'name="files[]"' in uguu_body and b'name="time"' not in uguu_body,
+                     uguu_body[:200].decode("utf-8", "replace"))
+        FakeImageHost.reset('{"success": true, "files": []}')
+        report.check("a JSON answer without an image URL is not published",
+                     discord_cover.CoverUploader(
+                         host="uguu", endpoint=endpoint, cache_file=_TMP / "uguu-bad.json",
+                         spacing=0.0).url_for(cover_file) is None)
+
+        FakeImageHost.reset(uguu_answer)
+        switched = discord_cover.CoverUploader(host="uguu", endpoint=endpoint,
+                                               cache_file=_TMP / "covers.json",
+                                               spacing=0.0)
+        report.check("a URL remembered for another host is not reused",
+                     switched.url_for(cover_file) == "https://h.uguu.se/self.jpg"
+                     and len(FakeImageHost.requests) == 1,
+                     f"{len(FakeImageHost.requests)} request(s)")
+
         FakeImageHost.reset("<html>502 Bad Gateway</html>")
         report.check("a host that answers rubbish leaves the artwork alone",
-                     discord_cover.CoverUploader(endpoint=endpoint, cache_file=_TMP / "broken.json",
+                     discord_cover.CoverUploader(host="litterbox", endpoint=endpoint,
+                                                 cache_file=_TMP / "broken.json",
                                                  spacing=0.0).url_for(cover_file) is None)
         FakeImageHost.reset("http://127.0.0.1/cover.png")
         report.check("a URL Discord could not fetch is refused",
-                     discord_cover.CoverUploader(endpoint=endpoint, cache_file=_TMP / "private.json",
+                     discord_cover.CoverUploader(host="litterbox", endpoint=endpoint,
+                                                 cache_file=_TMP / "private.json",
                                                  spacing=0.0).url_for(cover_file) is None)
 
         FakeImageHost.reset("https://litter.catbox.moe/art.png", delay=0.5)
-        art = discord_cover.CoverUploader(endpoint=endpoint, cache_file=_TMP / "art.json",
+        art = discord_cover.CoverUploader(host="litterbox", endpoint=endpoint,
+                                          cache_file=_TMP / "art.json",
                                           max_size=128, spacing=0.0)
         painter = presence.DiscordPresence(client_id="424242", socket_path=str(discord.path),
                                            cover=art, cover_provider=lambda item: cover_file,
