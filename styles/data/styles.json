@@ -84,7 +84,7 @@
     {"name": "Beatdown Hardcore", "family": "Hardcore", "aliases": ["beatdown", "beatdown hardcore"]},
     {"name": "Mathcore", "family": "Hardcore", "aliases": ["mathcore", "chaotic hardcore", "chaotic hardcore mathcore", "math rock core"]},
     {"name": "Metalcore", "family": "Hardcore", "aliases": ["metalcore", "metal core", "melodic metalcore", "technical metalcore", "melodic death metal metalcore", "progressive metalcore"]},
-    {"name": "Deathcore", "family": "Hardcore", "aliases": ["deathcore", "technical deathcore", "progressing deathcore", "progressive deathcore", "deathcore metalcore"]},
+    {"name": "Deathcore", "family": "Hardcore", "aliases": ["deathcore", "technical deathcore", "progressing deathcore", "deathcore metalcore"]},
     {"name": "Blackened Deathcore", "family": "Hardcore", "parent": "Deathcore", "aliases": ["blackened deathcore", "blackened deathcore symphonic", "progressive blackened deathcore"]},
     {"name": "Grindcore", "family": "Hardcore", "aliases": ["grindcore", "grind", "goregrind", "deathgrind", "brutal death metal grindcore", "deathgrind goregrind"]},
     {"name": "Powerviolence", "family": "Hardcore", "aliases": ["powerviolence", "power violence"]},
@@ -165,6 +165,7 @@
     {"name": "Epic Metal", "family": "Metal", "parent": "Power Metal", "aliases": ["epic metal", "epic"]},
     {"name": "Industrial Rock", "family": "Rock", "aliases": ["industrial rock"]},
     {"name": "Christian Rock", "family": "Rock", "aliases": []},
-    {"name": "Various", "family": "Metal", "aliases": []}
+    {"name": "Various", "family": "Metal", "aliases": []},
+    {"name": "Progressive Deathcore", "family": "Metal", "aliases": []}
   ]
 }

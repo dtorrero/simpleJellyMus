@@ -308,6 +308,83 @@
       ],
       "exclusive": true,
       "note": "review GUI"
+    },
+    "Nullchasm": {
+      "styles": [
+        "Progressive Deathcore"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Omech, Kelle": {
+      "styles": [
+        "Psy-Trance"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Pandora's Curse": {
+      "styles": [
+        "Deathcore"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Plastic Shell": {
+      "styles": [
+        "Electronic"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Quick and the Dead": {
+      "styles": [
+        "Pop Punk"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "RandomMus": {
+      "styles": [
+        "Electronic (unspecified)"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Santiago Torelli": {
+      "styles": [
+        "Electronic"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Subjects": {
+      "styles": [
+        "Progressive Deathcore"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Warflex": {
+      "styles": [
+        "Deathcore"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "The Underdogs": {
+      "styles": [
+        "Downtempo"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "The DNC": {
+      "styles": [
+        "Dance"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
     }
   },
   "albums": {
@@ -408,6 +485,76 @@
       ],
       "exclusive": true,
       "note": "review GUI"
+    },
+    "Rock-Posevy 03.10.1998 :: (c) Seva Novgorodsev 1977-1998": {
+      "styles": [
+        "Rock"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Rock-Posevy 10.10.1998 :: (c) Seva Novgorodsev 1977-1998": {
+      "styles": [
+        "Rock"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Rock-Posevy 19.09.1998 :: (c) Seva Novgorodsev 1977-1998": {
+      "styles": [
+        "Rock"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Rock-Posevy 26.09.1998 :: (c) Seva Novgorodsev 1977-1998": {
+      "styles": [
+        "Rock"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Rock-Posevy 29.08.1998 :: (c) Seva Novgorodsev 1977-1998": {
+      "styles": [
+        "Rock"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Rock-Posevy 31.10.1998 :: (c) Seva Novgorodsev 1977-1998": {
+      "styles": [
+        "Rock"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Slobax :: Schooly Boy II demo": {
+      "styles": [
+        "Skate Punk"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Zimmer's Hole :: Legion of Flames": {
+      "styles": [
+        "Heavy Metal"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "XNIDA :: XNIDA": {
+      "styles": [
+        "Abstract"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "Various Artists :: AM4 - The Very Best of Progressive Breaks Vol 1": {
+      "styles": [
+        "Breakbeat"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
     }
   },
   "tracks": {
@@ -477,6 +624,34 @@
       "styles": [],
       "exclusive": true,
       "note": "marked unknown in review GUI"
+    },
+    "Dethklok/Official Discography/2007 - ...and You Will Know Us by the Trail of Dead & Dethklok (Split)/04. Dethklok - Go Forth and Die.mp3": {
+      "styles": [
+        "Melodic Death Metal"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "single_files/DotaMus7.mp3": {
+      "styles": [
+        "Electronic (unspecified)"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "single_files/DotaMus5.mp3": {
+      "styles": [
+        "Electronic (unspecified)"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
+    },
+    "single_files/Bach Goldberg variations - Glenn Gould/[HD] Bach's Goldberg Variations [Glenn Gould, 1981 record] (BWV 988).mp3": {
+      "styles": [
+        "Classical"
+      ],
+      "exclusive": true,
+      "note": "review GUI"
     }
   }
 }
